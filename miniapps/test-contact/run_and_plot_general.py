@@ -27,7 +27,34 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
+
+# Professional academic presentation style
+mpl.rcParams['font.size'] = 14
+mpl.rcParams['font.family'] = 'sans-serif'
+mpl.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Helvetica']
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+mpl.rcParams['legend.fontsize'] = 12
+mpl.rcParams['figure.titlesize'] = 20
+mpl.rcParams['lines.linewidth'] = 2.5
+mpl.rcParams['lines.markersize'] = 8
+mpl.rcParams['axes.linewidth'] = 1.2
+mpl.rcParams['grid.linewidth'] = 0.8
+mpl.rcParams['grid.alpha'] = 0.3
+mpl.rcParams['axes.grid'] = True
+mpl.rcParams['axes.axisbelow'] = True
+mpl.rcParams['figure.facecolor'] = 'white'
+mpl.rcParams['axes.facecolor'] = 'white'
+mpl.rcParams['savefig.dpi'] = 300
+mpl.rcParams['savefig.bbox'] = 'tight'
+mpl.rcParams['savefig.facecolor'] = 'white'
+
+# Professional color palette (colorblind-friendly)
+COLORS = ['#0173B2', '#DE8F05', '#029E73', '#CC78BC', '#CA9161', '#949494', '#ECE133', '#56B4E9']
 
 
 # =============================================================================
@@ -35,25 +62,27 @@ import numpy as np
 # =============================================================================
 
 BASE_CONFIG = {
-    "np": 8,
+    "np": 4,
     "prob": 0,
     "model": "linear",          # "linear" or "nonlinear"
-    "sr": 0,
+    "sr": 1,
     "pr": 0,
-    "nsteps": 1,
+    "nsteps": 4,
     "msteps": 0,
     "tr": 2.0,
     "vis": False,
     "paraview": False,
-    "amgf": False,
+    "amgf": True,
+    "amgf_reversed": False,
     "amgf_fsolver": "auto",
-    "schwarz": False,
+    "schwarz": True,
     "schwarz_expand": False,
     "schwarz_cg_iters": 0,
     "schwarz_variant": 2,
     "schwarz_weight": 1.0,
     "schwarz_min_diag": 0.0,
-    "schwarz_uniform_weight": 1.0,
+    "schwarz_uniform_weight": 0.1,
+    "hybrid_amg": False,
     "subspace_pl": 0
 }
 
@@ -61,21 +90,25 @@ BASE_CONFIG = {
 # Each key maps to a list of values to test.
 SWEEP_PARAMETERS = {
     # Example solver sweep:
-    "amgf": [True],
-    "schwarz": [True],
-    "schwarz_variant": [2],
-    "schwarz_uniform_weight": [0.1],
+    #"amgf": [True, False],
+    #"schwarz": [True, False],
+    #"schwarz_variant": [2],
+    #"schwarz_uniform_weight": [0.05],
+    #"amgf_reversed": [True, False],
+    #"hybrid_amg": [True, False]
 
     # Uncomment for other experiments:
-    # "np": [1, 2, 4],
-    "sr": [0, 1, 2, 3],
+    #"np": [1, 2, 4, 8],
+    "sr": [0, 1, 2],
     # "pr": [0, 1],
     # "prob": [0, 1, 2],
 }
 
 # Which parameters define distinct curves in plots
 CURVE_KEYS = [
-    "sr"
+    "amgf",
+    "schwarz",
+    #sr
 ]
 
 # Which parameter should be used for x-axis in summary plots.
@@ -152,16 +185,31 @@ def format_solver_label(config):
     if not config.get("amgf", False):
         return "AMG"
 
+    base_label = ""
     if config.get("schwarz", False):
         cg_iters = config.get("schwarz_cg_iters", 0)
         if cg_iters and cg_iters > 0:
-            return f"AMGF + Schwarz-CG({cg_iters})"
-        return "AMGF + Schwarz"
+            base_label = f"AMGF + Schwarz-CG({cg_iters})"
+        else:
+            base_label = "AMGF + Schwarz"
 
-    fsolver = config.get("amgf_fsolver", "auto")
-    if fsolver == "auto":
-        return "AMGF + direct subspace"
-    return f"AMGF + {fsolver}"
+        if config.get("hybrid_amg", False):
+            base_label += " + Hybrid AMG"
+    else:
+        fsolver = config.get("amgf_fsolver", "auto")
+        if fsolver == "auto":
+            base_label = "AMGF + direct subspace"
+        else:
+            base_label = f"AMGF + {fsolver}"
+
+        # Add "Hybrid AMG" even when using direct subspace solver
+        if config.get("hybrid_amg", False):
+            base_label += " + Hybrid AMG"
+
+    if config.get("amgf_reversed", False):
+        base_label += " (reversed)"
+
+    return base_label
 
 
 def format_label_component(key, config):
@@ -169,8 +217,12 @@ def format_label_component(key, config):
 
     if key == "amgf":
         return None
+    if key == "amgf_reversed":
+        return "reversed order" if value else None
     if key == "schwarz":
         return None
+    if key == "hybrid_amg":
+        return "hybrid AMG smoother" if value else None
     if key == "amgf_fsolver":
         return None if config.get("schwarz", False) else f"subspace={value}"
     if key == "np":
@@ -243,6 +295,7 @@ def config_to_command(config):
         "--visualization" if config["vis"] else "--no-visualization",
         "--paraview" if config["paraview"] else "--no-paraview",
         "--amgf" if config["amgf"] else "--no-amgf",
+        "--amgf-reversed" if config["amgf_reversed"] else "--no-amgf-reversed",
         "-amgf-fsolver", str(config["amgf_fsolver"]),
         "--schwarz" if config["schwarz"] else "--no-schwarz",
         "--schwarz-expand" if config["schwarz_expand"] else "--no-schwarz-expand",
@@ -251,6 +304,7 @@ def config_to_command(config):
         "-schwarz-weight", str(config["schwarz_weight"]),
         "-schwarz-min-diag", str(config["schwarz_min_diag"]),
         "-schwarz-uniform-weight", str(config["schwarz_uniform_weight"]),
+        "-hybrid-amg" if config["hybrid_amg"] else "-no-hybrid-amg",
         "-subspace-pl", str(config["subspace_pl"])
     ]
     return cmd
@@ -315,13 +369,59 @@ def parse_scalar_float(text, label):
     return float(match.group(1)) if match else None
 
 
+def parse_amgf_setup_breakdown(text):
+    pattern = re.compile(
+        r"AMGF filtered setup time \[s\]: total=([0-9eE+.\-]+), "
+        r"AMG=([0-9eE+.\-]+), subspace=([0-9eE+.\-]+) "
+        r"\(PtAP=([0-9eE+.\-]+), solver=([0-9eE+.\-]+)\)"
+    )
+    breakdown = []
+    for match in pattern.finditer(text):
+        breakdown.append({
+            "total": float(match.group(1)),
+            "amg": float(match.group(2)),
+            "subspace": float(match.group(3)),
+            "ptap": float(match.group(4)),
+            "solver": float(match.group(5)),
+        })
+    return breakdown
+
+
+def parse_amgf_solve_breakdown(text):
+    pattern = re.compile(
+        r"AMGF solve time split \[s\]: total=([0-9eE+.\-]+), "
+        r"AMG=([0-9eE+.\-]+) \([0-9eE+.\-]+%\), "
+        r"subspace=([0-9eE+.\-]+) \([0-9eE+.\-]+%\), "
+        r"other=([0-9eE+.\-]+) \([0-9eE+.\-]+%\), applies=(\d+)"
+    )
+    breakdown = []
+    for match in pattern.finditer(text):
+        breakdown.append({
+            "total": float(match.group(1)),
+            "amg": float(match.group(2)),
+            "subspace": float(match.group(3)),
+            "other": float(match.group(4)),
+            "applies": int(match.group(5)),
+        })
+    return breakdown
+
+
+def sum_breakdown_entries(entries, keys):
+    return {key: float(sum(entry[key] for entry in entries)) for key in keys}
+
+
 def parse_run_output(output_text):
+    amgf_setup_breakdown = parse_amgf_setup_breakdown(output_text)
+    amgf_solve_breakdown = parse_amgf_solve_breakdown(output_text)
+
     data = {
         "optimizer_iterations": parse_scalar_int(output_text, "Optimizer number of iterations"),
         "initial_energy": parse_scalar_float(output_text, "Initial Energy objective"),
         "final_energy": parse_scalar_float(output_text, "Final Energy objective"),
         "pcg_iterations": parse_int_list_line(output_text, "PCG number of iterations"),
         "linear_solve_times": parse_float_list_line(output_text, "Linear solve times [s]"),
+        "amgf_setup_breakdown": amgf_setup_breakdown,
+        "amgf_solve_breakdown": amgf_solve_breakdown,
     }
 
     data["num_linear_solves_from_iters"] = len(data["pcg_iterations"])
@@ -363,6 +463,50 @@ def parse_run_output(output_text):
             data["time_per_iter_mean"] = None
     else:
         data["time_per_iter_mean"] = None
+
+    data["num_amgf_setup_entries"] = len(amgf_setup_breakdown)
+    data["num_amgf_solve_entries"] = len(amgf_solve_breakdown)
+
+    if amgf_setup_breakdown:
+        totals = sum_breakdown_entries(amgf_setup_breakdown, ["total", "amg", "subspace", "ptap", "solver"])
+        data["amgf_setup_total_sum"] = totals["total"]
+        data["amgf_setup_amg_sum"] = totals["amg"]
+        data["amgf_setup_subspace_sum"] = totals["subspace"]
+        data["amgf_setup_ptap_sum"] = totals["ptap"]
+        data["amgf_setup_solver_sum"] = totals["solver"]
+        data["amgf_setup_total_mean"] = totals["total"] / len(amgf_setup_breakdown)
+    else:
+        data["amgf_setup_total_sum"] = None
+        data["amgf_setup_amg_sum"] = None
+        data["amgf_setup_subspace_sum"] = None
+        data["amgf_setup_ptap_sum"] = None
+        data["amgf_setup_solver_sum"] = None
+        data["amgf_setup_total_mean"] = None
+
+    if amgf_solve_breakdown:
+        totals = sum_breakdown_entries(amgf_solve_breakdown, ["total", "amg", "subspace", "other"])
+        data["amgf_solve_total_sum"] = totals["total"]
+        data["amgf_solve_amg_sum"] = totals["amg"]
+        data["amgf_solve_subspace_sum"] = totals["subspace"]
+        data["amgf_solve_other_sum"] = totals["other"]
+        data["amgf_solve_total_mean"] = totals["total"] / len(amgf_solve_breakdown)
+        if totals["total"] > 0.0:
+            data["amgf_solve_amg_frac"] = totals["amg"] / totals["total"]
+            data["amgf_solve_subspace_frac"] = totals["subspace"] / totals["total"]
+            data["amgf_solve_other_frac"] = totals["other"] / totals["total"]
+        else:
+            data["amgf_solve_amg_frac"] = None
+            data["amgf_solve_subspace_frac"] = None
+            data["amgf_solve_other_frac"] = None
+    else:
+        data["amgf_solve_total_sum"] = None
+        data["amgf_solve_amg_sum"] = None
+        data["amgf_solve_subspace_sum"] = None
+        data["amgf_solve_other_sum"] = None
+        data["amgf_solve_total_mean"] = None
+        data["amgf_solve_amg_frac"] = None
+        data["amgf_solve_subspace_frac"] = None
+        data["amgf_solve_other_frac"] = None
 
     return data
 
@@ -458,37 +602,44 @@ def plot_per_solve_curves(records, output_dir):
         print("No per-solve data to plot.")
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
-    for rec in valid:
+    for idx, rec in enumerate(valid):
         label = config_to_label(rec["config"], CURVE_KEYS)
+        color = COLORS[idx % len(COLORS)]
         pcg = rec["parsed"]["pcg_iterations"]
         times = rec["parsed"]["linear_solve_times"]
 
         if pcg:
             x = np.arange(1, len(pcg) + 1)
-            axes[0].plot(x, pcg, marker="o", linewidth=1.8, alpha=0.9, label=label)
+            axes[0].plot(x, pcg, marker="o", color=color, label=label, markeredgewidth=0.5, markeredgecolor='white')
 
         if times:
             x = np.arange(1, len(times) + 1)
-            axes[1].plot(x, times, marker="o", linewidth=1.8, alpha=0.9, label=label)
+            axes[1].plot(x, times, marker="o", color=color, label=label, markeredgewidth=0.5, markeredgecolor='white')
 
-    axes[0].set_title("PCG iterations per linear solve")
-    axes[0].set_xlabel("Linear solve index")
-    axes[0].set_ylabel("PCG iterations")
-    axes[0].grid(True, alpha=0.3, linestyle="--")
+    axes[0].set_title("PCG Iterations per Linear Solve", fontweight='bold', pad=12)
+    axes[0].set_xlabel("Linear Solve Index", fontweight='semibold')
+    axes[0].set_ylabel("PCG Iterations", fontweight='semibold')
+    axes[0].set_yscale("log")
+    axes[0].grid(True, which='both', linestyle='--', linewidth=0.6)
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
 
-    axes[1].set_title("Linear solve time per linear solve")
-    axes[1].set_xlabel("Linear solve index")
-    axes[1].set_ylabel("Time [s]")
-    axes[1].grid(True, alpha=0.3, linestyle="--")
+    axes[1].set_title("Linear Solve Time per Solve", fontweight='bold', pad=12)
+    axes[1].set_xlabel("Linear Solve Index", fontweight='semibold')
+    axes[1].set_ylabel("Time (s)", fontweight='semibold')
+    axes[1].set_yscale("log")
+    axes[1].grid(True, which='both', linestyle='--', linewidth=0.6)
+    axes[1].spines['top'].set_visible(False)
+    axes[1].spines['right'].set_visible(False)
 
     for ax in axes:
-        ax.legend(fontsize=8)
+        ax.legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
 
     plt.tight_layout()
     out = output_dir / "per_solve_curves.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.savefig(out)
     print(f"Saved {out}")
     plt.show()
 
@@ -501,18 +652,19 @@ def plot_summary_curves(records, output_dir, x_axis_mode):
 
     grouped = group_records_by_curve(valid, CURVE_KEYS)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes = axes.flatten()
 
     metrics = [
-        ("pcg_total", "Total PCG iterations"),
-        ("pcg_mean", "Mean PCG iterations"),
-        ("time_total", "Total linear solve time [s]"),
-        ("time_mean", "Mean linear solve time [s]"),
+        ("pcg_total", "Total PCG Iterations"),
+        ("pcg_mean", "Mean PCG Iterations per Solve"),
+        ("time_total", "Total Linear Solve Time (s)"),
+        ("time_mean", "Mean Linear Solve Time (s)"),
     ]
 
     for ax, (metric_key, metric_title) in zip(axes, metrics):
-        for label, recs in grouped.items():
+        for idx, (label, recs) in enumerate(grouped.items()):
+            color = COLORS[idx % len(COLORS)]
             recs_sorted = sort_curve_records(recs, x_axis_mode)
 
             xvals = []
@@ -526,16 +678,20 @@ def plot_summary_curves(records, output_dir, x_axis_mode):
                     yvals.append(y)
 
             if xvals and yvals:
-                ax.plot(xvals, yvals, marker="o", linewidth=2.0, label=label)
+                ax.plot(xvals, yvals, marker="o", color=color, label=label,
+                       markeredgewidth=0.5, markeredgecolor='white')
 
-        ax.set_title(metric_title)
-        ax.set_xlabel(x_axis_mode)
-        ax.grid(True, alpha=0.3, linestyle="--")
-        ax.legend(fontsize=8)
+        ax.set_title(metric_title, fontweight='bold', pad=12)
+        ax.set_xlabel(x_axis_mode.replace('_', ' ').title(), fontweight='semibold')
+        ax.set_ylabel(metric_title.split('(')[0].strip(), fontweight='semibold')
+        ax.grid(True, linestyle='--', linewidth=0.6)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
 
     plt.tight_layout()
     out = output_dir / "summary_curves.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.savefig(out)
     print(f"Saved {out}")
     plt.show()
 
@@ -546,22 +702,95 @@ def plot_scatter_time_vs_iterations(records, output_dir):
         print("No aggregate timing vs iteration data to plot.")
         return
 
-    plt.figure(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
     grouped = group_records_by_curve(valid, CURVE_KEYS)
-    for label, recs in grouped.items():
+    for idx, (label, recs) in enumerate(grouped.items()):
+        color = COLORS[idx % len(COLORS)]
         x = [r["parsed"]["pcg_total"] for r in recs]
         y = [r["parsed"]["time_total"] for r in recs]
-        plt.scatter(x, y, s=70, alpha=0.85, label=label)
+        ax.scatter(x, y, s=120, alpha=0.85, label=label, color=color,
+                  edgecolors='white', linewidth=0.5)
 
-    plt.xlabel("Total PCG iterations")
-    plt.ylabel("Total linear solve time [s]")
-    plt.title("Timing vs iteration")
-    plt.grid(True, alpha=0.3, linestyle="--")
-    plt.legend(fontsize=8)
+    ax.set_xlabel("Total PCG Iterations", fontweight='semibold')
+    ax.set_ylabel("Total Linear Solve Time (s)", fontweight='semibold')
+    ax.set_title("Total Time vs Total Iterations", fontweight='bold', pad=12)
+    ax.grid(True, linestyle='--', linewidth=0.6)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
 
+    plt.tight_layout()
     out = output_dir / "time_vs_iterations.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.savefig(out)
+    print(f"Saved {out}")
+    plt.show()
+
+
+def build_run_tick_label(record, x_axis_mode):
+    keys = list(CURVE_KEYS)
+    if x_axis_mode != "run_index" and x_axis_mode not in keys:
+        keys.append(x_axis_mode)
+    return config_to_label(record["config"], keys)
+
+
+def plot_timing_breakdown(records, output_dir, x_axis_mode):
+    valid = [r for r in records if r["parsed"]["amgf_solve_total_sum"] is not None]
+    if not valid:
+        print("No AMGF timing breakdown data to plot.")
+        return
+
+    ordered = sort_curve_records(valid, x_axis_mode)
+    labels = [build_run_tick_label(rec, x_axis_mode) for rec in ordered]
+    x = np.arange(len(ordered))
+
+    solve_amg = np.array([rec["parsed"]["amgf_solve_amg_sum"] for rec in ordered], dtype=float)
+    solve_subspace = np.array([rec["parsed"]["amgf_solve_subspace_sum"] for rec in ordered], dtype=float)
+    solve_other = np.array([rec["parsed"]["amgf_solve_other_sum"] for rec in ordered], dtype=float)
+
+    setup_ptap = np.array([
+        rec["parsed"]["amgf_setup_ptap_sum"] if rec["parsed"]["amgf_setup_ptap_sum"] is not None else 0.0
+        for rec in ordered
+    ], dtype=float)
+    setup_solver = np.array([
+        rec["parsed"]["amgf_setup_solver_sum"] if rec["parsed"]["amgf_setup_solver_sum"] is not None else 0.0
+        for rec in ordered
+    ], dtype=float)
+    setup_amg = np.array([
+        rec["parsed"]["amgf_setup_amg_sum"] if rec["parsed"]["amgf_setup_amg_sum"] is not None else 0.0
+        for rec in ordered
+    ], dtype=float)
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(10, 1.4 * len(ordered)), 10), sharex=True)
+
+    bar_width = 0.7
+    axes[0].bar(x, solve_amg, label="AMG", color=COLORS[0], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[0].bar(x, solve_subspace, bottom=solve_amg, label="Subspace", color=COLORS[1], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[0].bar(x, solve_other, bottom=solve_amg + solve_subspace, label="Other", color=COLORS[2], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[0].set_title("AMGF Solve Timing Breakdown", fontweight='bold', pad=12)
+    axes[0].set_ylabel("Accumulated Time (s)", fontweight='semibold')
+    axes[0].grid(True, axis="y", linestyle='--', linewidth=0.6)
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
+    axes[0].legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
+
+    axes[1].bar(x, setup_amg, label="AMG Setup", color=COLORS[3], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[1].bar(x, setup_ptap, bottom=setup_amg, label="PtAP", color=COLORS[4], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[1].bar(x, setup_solver, bottom=setup_amg + setup_ptap, label="Subspace Solver", color=COLORS[5], width=bar_width, edgecolor='white', linewidth=0.5)
+    axes[1].set_title("AMGF Filtered-Subspace Setup Breakdown", fontweight='bold', pad=12)
+    axes[1].set_ylabel("Accumulated Time (s)", fontweight='semibold')
+    axes[1].grid(True, axis="y", linestyle='--', linewidth=0.6)
+    axes[1].spines['top'].set_visible(False)
+    axes[1].spines['right'].set_visible(False)
+    axes[1].legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
+
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=30, ha="right")
+    axes[1].set_xlabel("Run Configuration", fontweight='semibold')
+
+    plt.tight_layout()
+    out = output_dir / "timing_breakdown.png"
+    plt.savefig(out)
     print(f"Saved {out}")
     plt.show()
 
@@ -689,6 +918,7 @@ def main():
     plot_per_solve_curves(records, output_dir)
     plot_summary_curves(records, output_dir, X_AXIS_MODE)
     plot_scatter_time_vs_iterations(records, output_dir)
+    plot_timing_breakdown(records, output_dir, X_AXIS_MODE)
 
     print("Done.")
 

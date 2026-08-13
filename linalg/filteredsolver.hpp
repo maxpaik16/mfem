@@ -74,12 +74,18 @@ public:
    /// Set a solver @a S that operates on the filtered subspace operator $ P^T A P $.
    void SetFilteredSubspaceSolver(Solver &S);
 
+   /// Set print level for timing diagnostics.
+   virtual void SetPrintLevel(int print_lvl) { print_level = print_lvl; }
+
+   /// Enable or disable reversed order (subspace → AMG → subspace instead of AMG → subspace → AMG).
+   void SetReversedOrder(bool reversed) { reversed_order = reversed; }
+
    /// Apply the filtered solver
    void Mult(const Vector &x, Vector &y) const override;
 
    void SelectFilteredSubspace(const SubspaceSelectionMethod);
 
-   virtual ~FilteredSolver() = default;
+   virtual ~FilteredSolver() override;
 
    FilteredSolver(const FilteredSolver&) = delete;
    FilteredSolver& operator=(const FilteredSolver&) = delete;
@@ -108,12 +114,35 @@ private:
                                            const Operator *Pop) const;
    /// Finalize solver
    void MakeSolver() const;
+   /// Reset timing state for the current operator/setup cycle.
+   void ResetTimingData() const;
+   /// Print timing data accumulated for the current operator/setup cycle.
+   void FlushTimingData() const;
 
    // Work vectors used in Mult.
    mutable Vector z;
    mutable Vector rf;
    mutable Vector xf;
    mutable Vector r;
+
+   /// Print level for timing diagnostics.
+   int print_level = 0;
+   /// If true, apply subspace → AMG → subspace instead of AMG → subspace → AMG.
+   bool reversed_order = false;
+   /// Setup time split [s] for the current operator/setup cycle.
+   mutable double setup_total_time = 0.0;
+   mutable double setup_base_solver_time = 0.0;
+   mutable double setup_ptap_time = 0.0;
+   mutable double setup_subspace_solver_time = 0.0;
+   /// Aggregate apply time split [s] for the current operator/setup cycle.
+   mutable double cycle_total_time = 0.0;
+   mutable double cycle_amg_time = 0.0;
+   mutable double cycle_subspace_time = 0.0;
+   mutable double cycle_other_time = 0.0;
+   /// Number of preconditioner applications in the current cycle.
+   mutable int cycle_num_mult_calls = 0;
+   /// True once setup or apply timings have been accumulated for the current cycle.
+   mutable bool have_timing_data = false;
 
 }; // mfem::FilteredSolver class
 
@@ -160,6 +189,19 @@ public:
 
    /// Set the parallel transfer operator @a P for the filtered subspace.
    void SetFilteredSubspaceTransferOperator(const HypreParMatrix &Pop);
+
+   /// Test if the preconditioner is SPD by checking symmetry and positive-definiteness
+   /// with random vectors. Performs num_tests iterations, checking:
+   ///   1. Symmetry: (M u, v) = (u, M v) for random vectors u and v
+   ///   2. Positive-definiteness: (u, M u) > 0 for random vector u
+   /// Returns true if all tests pass, false otherwise.
+   /// If verbose is true, prints detailed statistics to rank 0.
+   bool TestSPD(int num_tests = 20, int seed = 12345, bool verbose = true) const;
+
+   /// Verify operator formulations and SPD properties.
+   /// Tests the equivalence of different operator representations and their symmetry/positivity.
+   /// Should only be called after SetOperator and solver setup.
+   void VerifyOperatorFormulations(int num_tests = 10, int seed = 12345, bool verbose = true) const;
 
    /// Destructor.
    ~AMGFSolver() override = default;

@@ -28,6 +28,10 @@
 // mpirun -np 4 ./contact -prob 2 -sr 0 -pr 0 -tr 2 -nsteps 6 -msteps 0 -nonlin -amgf -amgf-fsolver auto
 // mpirun -np 4 ./contact -prob 2 -sr 0 -pr 0 -tr 2 -nsteps 6 -msteps 0 -nonlin -no-amgf
 
+// Problem 3: MFEM text (linear elasticity)
+// mpirun -np 4 ./contact -prob 3 -sr 0 -pr 0 -tr 2 -nsteps 4  -msteps 0 -amgf -amgf-fsolver auto
+// mpirun -np 4 ./contact -prob 3 -sr 0 -pr 0 -tr 2 -nsteps 4  -msteps 0 -no-amgf
+
 // Description:
 // This miniapp solves benchmark frictionless contact problems using a
 // self-contained Interior Point (IP) optimizer. Contact constraints
@@ -60,7 +64,8 @@ enum problem_name
 {
    twoblock,
    ironing,
-   beamsphere
+   beamsphere,
+   mfemtext
 };
 
 Mesh * GetProblemMesh(problem_name prob_name);
@@ -114,7 +119,8 @@ int main(int argc, char *argv[])
                   "Choice of problem:"
                   "0: two-block problem"
                   "1: ironing problem"
-                  "2: beam-sphere problem");
+                  "2: beam-sphere problem"
+                  "3: MFEM text problem");
    args.AddOption(&nonlinear, "-nonlin", "--nonlinear", "-lin",
                   "--linear", "Choice between linear and non-linear Elasticiy model.");
    args.AddOption(&sref, "-sr", "--serial-refinements",
@@ -158,7 +164,7 @@ int main(int argc, char *argv[])
 
    // Validate selection and convert to enum.
    MFEM_VERIFY(prob_no >= 0 &&
-               prob_no <= 2, "Unknown test problem number: " << prob_no);
+               prob_no <= 3, "Unknown test problem number: " << prob_no);
 
    prob_name = (problem_name)prob_no;
 
@@ -216,6 +222,13 @@ int main(int argc, char *argv[])
          E[0] = 1.0;  E[1] = 1e3;
          nu[0] = 0.499;  nu[1] = 0.0;
          break;
+      case mfemtext:
+         ess_bdr_attr.Append(2); ess_bdr_attr_comp.Append(-1);
+         ess_bdr_attr.Append(6); ess_bdr_attr_comp.Append(-1);
+         // Soft letters on stiff base
+         E[0] = 1.0;  E[1] = 1e3;
+         nu[0] = 0.0;  nu[1] = 0.499;
+         break;
       case beamsphere:
          ess_bdr_attr.Append(1); ess_bdr_attr_comp.Append(0);
          ess_bdr_attr.Append(2); ess_bdr_attr_comp.Append(1);
@@ -250,6 +263,7 @@ int main(int argc, char *argv[])
    {
       case twoblock:
       case  ironing:
+      case mfemtext:
          mortar_attr.insert(3);
          nonmortar_attr.insert(4);
          break;
@@ -342,6 +356,7 @@ int main(int argc, char *argv[])
       {
          case twoblock:
          case ironing:
+         case mfemtext:
             if (ess_bdr.Size())
             {
                ess_bdr = 0; ess_bdr[5] = 1;
@@ -441,7 +456,7 @@ int main(int argc, char *argv[])
       optimizer.SetMaxIter(100);
       optimizer.SetLinearSolver(&cgsolver);
       optimizer.SetPrintLevel(0);
-      optimizer.SetLOBPCG(&lobpcg);
+      //optimizer.SetLOBPCG(&lobpcg);
 
       // Initial guess = previous reference configuration.
       x_gf.SetTrueVector();
@@ -469,7 +484,7 @@ int main(int argc, char *argv[])
       real_t Efinal = contact.E(xf, eval_err);
       Array<int> & PCGiterations = optimizer.GetLinearSolverIterations();
       Array<real_t> eigenvalues;
-      lobpcg.GetEigenvalues(eigenvalues);
+      //lobpcg.GetEigenvalues(eigenvalues);
       ParGridFunction x(&fes_copy);
 
       if (Mpi::Root())
@@ -514,7 +529,7 @@ int main(int argc, char *argv[])
 
          for (int eigi = 0; eigi < eigenvalues.Size(); ++eigi)
          {
-            x = lobpcg.GetEigenvector(eigi);
+            //x = lobpcg.GetEigenvector(eigi);
             sol_sock << "parallel " << num_procs << " " << myid << "\n"
                      << "solution\n" << pmesh_copy << x << flush
                      << "window_title 'Eigenmode " << eigi+1 << '/' << nev
@@ -586,6 +601,270 @@ Mesh * GetProblemMesh(problem_name prob_name)
    if (prob_name == problem_name::beamsphere)
    {
       return new Mesh("meshes/beam-sphere.mesh",1);
+   }
+   else if (prob_name == problem_name::mfemtext)
+   {
+      // Create MFEM text: four letter meshes on top of a base block
+      Mesh * combined_mesh = nullptr;
+      constexpr real_t scale = 9.0/3.6;
+      constexpr real_t lx0 = 12.0*scale*0.6, ly0 = 1.6*scale*0.6, lz0 = 1.0*scale*0.6;
+      constexpr int nx0 = 48, ny0 = 8, nz0 = 4;
+      Mesh mesh0 = Mesh::MakeCartesian3D(nx0, ny0, nz0, Element::HEXAHEDRON,
+                                        lx0, ly0, lz0);
+
+      // Adjust boundary attributes for base block
+      for (int i = 0; i<mesh0.GetNBE(); i++)
+      {
+         int battr = mesh0.GetBdrElement(i)->GetAttribute();
+         int new_battr;
+         switch (battr)
+         {
+            case 1: new_battr = 2; break;
+            case 6: new_battr = 3; break;
+            default: new_battr = 1; break;
+         }
+         mesh0.SetBdrAttribute(i, new_battr);
+      }
+      mesh0.SetAttributes();
+
+      // Letter dimensions (letters lie flat on the block)
+      constexpr real_t letter_width = 2.0;   // x direction
+      constexpr real_t letter_height = 3.0;  // y direction (depth into the page)
+      constexpr real_t letter_thickness = 0.5;  // z direction (height off the block)
+      constexpr real_t bar_thickness = 0.4;
+      constexpr real_t spacing = 0.5;
+
+      // Create array to hold all letter meshes
+      Array<Mesh*> letter_meshes;
+      letter_meshes.Append(&mesh0);
+
+      // Starting x position (centered on base)
+      real_t x_start = (lx0 - (4*letter_width + 3*spacing)) / 2;
+
+      // Helper function to create a bar mesh (lying flat in xy plane)
+      auto create_bar = [&](real_t x_pos, real_t y_pos, real_t z_pos,
+                           real_t x_size, real_t y_size, real_t z_size) -> Mesh*
+      {
+         int nx = std::max(2, int(x_size * 5));
+         int ny = std::max(2, int(y_size * 5));
+         int nz = std::max(2, int(z_size * 5));
+         Mesh* bar = new Mesh(Mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON,
+                                                     x_size, y_size, z_size));
+
+         // Set element attributes
+         for (int i = 0; i < bar->GetNE(); i++) { bar->GetElement(i)->SetAttribute(2); }
+         bar->SetAttributes();
+
+         // Set boundary attributes
+         for (int i = 0; i < bar->GetNBE(); i++)
+         {
+            int battr = bar->GetBdrElement(i)->GetAttribute();
+            int new_battr;
+            switch (battr)
+            {
+               case 1: new_battr = 4; break;
+               case 6: new_battr = 6; break;
+               default: new_battr = 5; break;
+            }
+            bar->SetBdrAttribute(i, new_battr);
+         }
+         bar->SetAttributes();
+
+         // Transform to position
+         Vector shift(3);
+         shift(0) = x_pos;
+         shift(1) = y_pos;
+         shift(2) = z_pos;
+
+         auto shift_map = [&](const Vector &x, Vector &y)
+         {
+            y.SetSize(3);
+            y = x;
+            y += shift;
+         };
+
+         bar->Transform(shift_map);
+         return bar;
+      };
+
+      // Letter M lying flat: Two bars along y-axis with two diagonal strokes
+      // Layout in xy plane (flat on the block), thin in z direction
+      // M shape: left bar, right bar, and two diagonals meeting in the middle
+
+      real_t m_x = x_start;
+      real_t letter_y_start = (ly0 - letter_height) / 2;
+      real_t letter_z = lz0;
+
+      // Left bar (extends in y direction)
+      Mesh* m_left = create_bar(m_x, letter_y_start, letter_z,
+                                bar_thickness, letter_height, letter_thickness);
+
+      // Right bar (extends in y direction)
+      Mesh* m_right = create_bar(m_x + letter_width - bar_thickness, letter_y_start, letter_z,
+                                 bar_thickness, letter_height, letter_thickness);
+
+      // For the diagonals lying flat: shear in the xy plane
+      // Left diagonal: goes from top-left bar (inner edge) down to center
+      // Right diagonal: goes from top-right bar (inner edge) down to center
+      real_t diag_y_length = letter_height * 0.5;  // extent in y
+      real_t diag_x_offset = (letter_width / 2 - bar_thickness);  // extent in x
+
+      // Left diagonal (from top-left going down and right to center)
+      int nx_diag = std::max(2, int(bar_thickness * 5));
+      int ny_diag = std::max(2, int(diag_y_length * 5));
+      int nz_diag = std::max(2, int(letter_thickness * 5));
+
+      Mesh* m_diag1 = new Mesh(Mesh::MakeCartesian3D(nx_diag, ny_diag, nz_diag,
+                                                       Element::HEXAHEDRON,
+                                                       bar_thickness, diag_y_length, letter_thickness));
+
+      // Set attributes for left diagonal
+      for (int i = 0; i < m_diag1->GetNE(); i++) { m_diag1->GetElement(i)->SetAttribute(2); }
+      m_diag1->SetAttributes();
+      for (int i = 0; i < m_diag1->GetNBE(); i++)
+      {
+         int battr = m_diag1->GetBdrElement(i)->GetAttribute();
+         int new_battr = (battr == 1) ? 4 : (battr == 6) ? 6 : 5;
+         m_diag1->SetBdrAttribute(i, new_battr);
+      }
+      m_diag1->SetAttributes();
+
+      // Transform left diagonal: starts at left bar, converges to center
+      // At y=top (x(1)=diag_y_length): left edge at m_x (outer edge of left bar)
+      // At y=bottom (x(1)=0): bar centered at m_x + letter_width/2
+      auto left_diag_transform = [&](const Vector &x, Vector &y)
+      {
+         y.SetSize(3);
+         // Shear: starts at m_x, shifts right by (letter_width/2 - bar_thickness/2) as y decreases
+         y(0) = x(0) + m_x + (1.0 - x(1) / diag_y_length) * (letter_width / 2 - bar_thickness / 2);
+         y(1) = x(1) + letter_y_start + letter_height - diag_y_length;
+         y(2) = x(2) + letter_z;
+      };
+      m_diag1->Transform(left_diag_transform);
+
+      // Right diagonal (from top-right going down and left to center)
+      Mesh* m_diag2 = new Mesh(Mesh::MakeCartesian3D(nx_diag, ny_diag, nz_diag,
+                                                       Element::HEXAHEDRON,
+                                                       bar_thickness, diag_y_length, letter_thickness));
+
+      // Set attributes for right diagonal
+      for (int i = 0; i < m_diag2->GetNE(); i++) { m_diag2->GetElement(i)->SetAttribute(2); }
+      m_diag2->SetAttributes();
+      for (int i = 0; i < m_diag2->GetNBE(); i++)
+      {
+         int battr = m_diag2->GetBdrElement(i)->GetAttribute();
+         int new_battr = (battr == 1) ? 4 : (battr == 6) ? 6 : 5;
+         m_diag2->SetBdrAttribute(i, new_battr);
+      }
+      m_diag2->SetAttributes();
+
+      // Transform right diagonal: starts at right bar, converges to center
+      // At y=top (x(1)=diag_y_length): right edge at m_x + letter_width (outer edge of right bar)
+      // At y=bottom (x(1)=0): bar centered at m_x + letter_width/2
+      auto right_diag_transform = [&](const Vector &x, Vector &y)
+      {
+         y.SetSize(3);
+         // Shear: starts at m_x + letter_width - bar_thickness, shifts left by (letter_width/2 - bar_thickness/2) as y decreases
+         y(0) = x(0) + m_x + letter_width - bar_thickness - (1.0 - x(1) / diag_y_length) * (letter_width / 2 - bar_thickness / 2);
+         y(1) = x(1) + letter_y_start + letter_height - diag_y_length;
+         y(2) = x(2) + letter_z;
+      };
+      m_diag2->Transform(right_diag_transform);
+
+      // Letter F lying flat: Left bar with top and middle horizontal bars
+      real_t f_x = x_start + letter_width + spacing;
+      Mesh* f_vert = create_bar(f_x, letter_y_start, letter_z,
+                                bar_thickness, letter_height, letter_thickness);
+      Mesh* f_top = create_bar(f_x + bar_thickness, letter_y_start + letter_height - bar_thickness, letter_z,
+                              letter_width * 0.7, bar_thickness, letter_thickness);
+      Mesh* f_mid = create_bar(f_x + bar_thickness, letter_y_start + letter_height * 0.5 - bar_thickness * 0.5, letter_z,
+                              letter_width * 0.5, bar_thickness, letter_thickness);
+
+      // Letter E lying flat: Left bar with top, middle, and bottom horizontal bars
+      real_t e_x = x_start + 2*(letter_width + spacing);
+      Mesh* e_vert = create_bar(e_x, letter_y_start, letter_z,
+                                bar_thickness, letter_height, letter_thickness);
+      Mesh* e_top = create_bar(e_x + bar_thickness, letter_y_start + letter_height - bar_thickness, letter_z,
+                              letter_width * 0.7, bar_thickness, letter_thickness);
+      Mesh* e_mid = create_bar(e_x + bar_thickness, letter_y_start + letter_height * 0.5 - bar_thickness * 0.5, letter_z,
+                              letter_width * 0.5, bar_thickness, letter_thickness);
+      Mesh* e_bot = create_bar(e_x + bar_thickness, letter_y_start, letter_z,
+                              letter_width * 0.7, bar_thickness, letter_thickness);
+
+      // Second letter M lying flat (same construction as first M)
+      real_t m2_x = x_start + 3*(letter_width + spacing);
+
+      // Left bar (extends in y direction)
+      Mesh* m2_left = create_bar(m2_x, letter_y_start, letter_z,
+                                 bar_thickness, letter_height, letter_thickness);
+
+      // Right bar (extends in y direction)
+      Mesh* m2_right = create_bar(m2_x + letter_width - bar_thickness, letter_y_start, letter_z,
+                                  bar_thickness, letter_height, letter_thickness);
+
+      // Left diagonal for second M
+      Mesh* m2_diag1 = new Mesh(Mesh::MakeCartesian3D(nx_diag, ny_diag, nz_diag,
+                                                        Element::HEXAHEDRON,
+                                                        bar_thickness, diag_y_length, letter_thickness));
+
+      for (int i = 0; i < m2_diag1->GetNE(); i++) { m2_diag1->GetElement(i)->SetAttribute(2); }
+      m2_diag1->SetAttributes();
+      for (int i = 0; i < m2_diag1->GetNBE(); i++)
+      {
+         int battr = m2_diag1->GetBdrElement(i)->GetAttribute();
+         int new_battr = (battr == 1) ? 4 : (battr == 6) ? 6 : 5;
+         m2_diag1->SetBdrAttribute(i, new_battr);
+      }
+      m2_diag1->SetAttributes();
+
+      auto left_diag2_transform = [&](const Vector &x, Vector &y)
+      {
+         y.SetSize(3);
+         y(0) = x(0) + m2_x + (1.0 - x(1) / diag_y_length) * (letter_width / 2 - bar_thickness / 2);
+         y(1) = x(1) + letter_y_start + letter_height - diag_y_length;
+         y(2) = x(2) + letter_z;
+      };
+      m2_diag1->Transform(left_diag2_transform);
+
+      // Right diagonal for second M
+      Mesh* m2_diag2 = new Mesh(Mesh::MakeCartesian3D(nx_diag, ny_diag, nz_diag,
+                                                        Element::HEXAHEDRON,
+                                                        bar_thickness, diag_y_length, letter_thickness));
+
+      for (int i = 0; i < m2_diag2->GetNE(); i++) { m2_diag2->GetElement(i)->SetAttribute(2); }
+      m2_diag2->SetAttributes();
+      for (int i = 0; i < m2_diag2->GetNBE(); i++)
+      {
+         int battr = m2_diag2->GetBdrElement(i)->GetAttribute();
+         int new_battr = (battr == 1) ? 4 : (battr == 6) ? 6 : 5;
+         m2_diag2->SetBdrAttribute(i, new_battr);
+      }
+      m2_diag2->SetAttributes();
+
+      auto right_diag2_transform = [&](const Vector &x, Vector &y)
+      {
+         y.SetSize(3);
+         y(0) = x(0) + m2_x + letter_width - bar_thickness - (1.0 - x(1) / diag_y_length) * (letter_width / 2 - bar_thickness / 2);
+         y(1) = x(1) + letter_y_start + letter_height - diag_y_length;
+         y(2) = x(2) + letter_z;
+      };
+      m2_diag2->Transform(right_diag2_transform);
+
+      // Combine all meshes: base + individual letter components
+      Mesh* mesh_array[] = {&mesh0,
+                           m_left, m_right, m_diag1, m_diag2,
+                           f_vert, f_top, f_mid,
+                           e_vert, e_top, e_mid, e_bot,
+                           m2_left, m2_right, m2_diag1, m2_diag2};
+      combined_mesh = new Mesh(mesh_array, 16);
+
+      // Clean up temporary meshes
+      delete m_left; delete m_right; delete m_diag1; delete m_diag2;
+      delete f_vert; delete f_top; delete f_mid;
+      delete e_vert; delete e_top; delete e_mid; delete e_bot;
+      delete m2_left; delete m2_right; delete m2_diag1; delete m2_diag2;
+
+      return combined_mesh;
    }
    else // construct the two-block or ironing mesh
    {

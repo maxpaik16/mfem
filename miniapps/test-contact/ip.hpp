@@ -14,8 +14,9 @@
 
 #include "optcontactproblem.hpp"
 
-// Forward declaration
+// Forward declarations
 class HypreSchwarz;
+class HypreBoomerAMGWithSchwarzSmoother;
 
 namespace mfem
 {
@@ -75,6 +76,9 @@ public:
    /// Set linear solver
    void SetLinearSolver(Solver * solver_) { solver = solver_; };
 
+   /// Set preconditioner (for SPD testing)
+   void SetPreconditioner(Solver * prec_) { preconditioner = prec_; };
+
    /// Set print level
    void SetPrintLevel(int print_level_) { print_level = print_level_; };
 
@@ -111,7 +115,17 @@ public:
 
    void SetSchwarzSolver(HypreSchwarz* schwarz) { schwarz_solver = schwarz; }
 
+   void SetHybridAMGWrapper(HypreBoomerAMGWithSchwarzSmoother* wrapper) { hybrid_amg_wrapper = wrapper; }
+
+   void SetHybridContactDirectSolver(Solver* solver) { hybrid_contact_direct_solver = solver; }
+
    void SetSchurComplementMode(bool use_schur) { use_schur_complement = use_schur; }
+
+   void SetTestSPD(bool test, int num_tests = 20)
+   {
+      test_spd = test;
+      test_spd_num_tests = num_tests;
+   }
 
 protected:
    /// OptContactProblem (not owned).
@@ -119,6 +133,9 @@ protected:
 
    /// Linear solver (not owned)
    Solver * solver = nullptr;
+
+   /// Preconditioner (not owned)
+   Solver * preconditioner = nullptr;
 
    real_t abs_tol;
    int  max_iter;
@@ -196,9 +213,17 @@ protected:
    bool schwarz_unweighted = false;
    real_t schwarz_uniform_weight = -1.0;
    HypreSchwarz* schwarz_solver = nullptr;
+   HypreBoomerAMGWithSchwarzSmoother* hybrid_amg_wrapper = nullptr;
+   Solver* hybrid_contact_direct_solver = nullptr;
+   HypreParMatrix* contact_PTAP = nullptr;  // P^T A P for contact subspace
+   HypreParMatrix* contact_transfer_P = nullptr;  // Transfer operator P for contact subspace
 
    // Schur complement solver option
    bool use_schur_complement = false;
+
+   // SPD testing options
+   bool test_spd = false;
+   int test_spd_num_tests = 20;
 
 private:
    /// Form (regularized) IP-Newton linear system matrix

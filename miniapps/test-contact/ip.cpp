@@ -11,6 +11,7 @@
 
 #include "ip.hpp"
 #include "../common/schwarz_solver.hpp"
+#include <sstream>
 
 namespace mfem
 {
@@ -420,14 +421,16 @@ void IPSolver::FormIPNewtonMat(BlockVector & x, Vector & l,
 // Build Schwarz subdomains from contact constraint Jacobian
 void IPSolver::BuildSchwarzSubdomains(HypreParMatrix* Areduced, const BlockVector& x)
 {
-   if (!use_schwarz_subspace) return;
+   // Build subdomains if using Schwarz subspace solver OR hybrid AMG
+   if (!use_schwarz_subspace && !hybrid_amg_wrapper) return;
 
    // Get constraint Jacobian J and transfer operator P
    HypreParMatrix* J = problem->Duc(x);  // J: constraints × displacements
    HypreParMatrix* P = problem->GetContactSubspaceTransferOperator();  // P: subspace × displacements
 
-   // Check if Schwarz solver is set
-   if (!schwarz_solver) return;
+   // Check if Schwarz solver is set (only needed for AMGF or hybrid AMG with Schwarz)
+   // For hybrid AMG with direct solver, schwarz_solver may be null
+   if (!hybrid_amg_wrapper && !schwarz_solver) return;
 
    // Define D diagonal matrix in the same way as Wmm
    Vector D_diag(dimM);
@@ -477,8 +480,43 @@ void IPSolver::BuildSchwarzSubdomains(HypreParMatrix* Areduced, const BlockVecto
       }
    }
 
+   // Cache the transfer operator P for later use
+   // Delete old P if it exists and cache the new one
+   if (contact_transfer_P) { delete contact_transfer_P; }
+   contact_transfer_P = new HypreParMatrix(*P);  // Make a copy to own it
+
    // Compute projected operator P^T * Areduced * P
-   HypreParMatrix* PTAP = RAP(Areduced, P);
+   // Delete old PTAP if it exists and create new one
+   if (contact_PTAP) { delete contact_PTAP; }
+   contact_PTAP = RAP(Areduced, P);
+   HypreParMatrix* PTAP = contact_PTAP;  // Alias for compatibility with existing code
+
+   // Save J, D, P, PTAP, and Areduced matrices for analysis
+   {
+      std::ostringstream j_filename, d_filename, p_filename, ptap_filename, areduced_filename;
+      j_filename << "mats/J_matrix_iter_" << iter << ".mat";
+      d_filename << "mats/D_matrix_iter_" << iter << ".mat";
+      p_filename << "mats/P_matrix_iter_" << iter << ".mat";
+      ptap_filename << "mats/PTAP_matrix_iter_" << iter << ".mat";
+      areduced_filename << "mats/Areduced_matrix_iter_" << iter << ".mat";
+
+      J->Print(j_filename.str());
+      D->Print(d_filename.str());
+      P->Print(p_filename.str());
+      PTAP->Print(ptap_filename.str());
+      Areduced->Print(areduced_filename.str());
+
+      if (myid == 0)
+      {
+         mfem::out << "\n=== AMGF SUBSYSTEM USED: P^T * A * P (PTAP) ===" << std::endl;
+         mfem::out << "    J shape: " << J->GetGlobalNumRows() << " x " << J->GetGlobalNumCols() << std::endl;
+         mfem::out << "    D shape: " << D->GetGlobalNumRows() << " x " << D->GetGlobalNumCols() << std::endl;
+         mfem::out << "    P shape: " << P->GetGlobalNumRows() << " x " << P->GetGlobalNumCols() << std::endl;
+         mfem::out << "    Areduced shape: " << Areduced->GetGlobalNumRows() << " x " << Areduced->GetGlobalNumCols() << std::endl;
+         mfem::out << "    PTAP shape: " << PTAP->GetGlobalNumRows() << " x " << PTAP->GetGlobalNumCols() << std::endl;
+         mfem::out << "    Saved to: mats/*_matrix_iter_" << iter << ".mat" << std::endl;
+      }
+   }
 
    // Merge J matrix to access local rows
    SparseMatrix merged_J;
@@ -880,19 +918,48 @@ void IPSolver::BuildSchwarzSubdomains(HypreParMatrix* Areduced, const BlockVecto
       mfem::out << std::endl;
    }
 
-   // Initialize HYPRE Schwarz if not already done
-   if (!schwarz_solver->schwarz_solver)
+   // Initialize HYPRE Schwarz if not already done (only when using Schwarz)
+   if (schwarz_solver && !schwarz_solver->schwarz_solver)
    {
       HYPRE_SchwarzCreate(&schwarz_solver->schwarz_solver);
       HYPRE_SchwarzSetVariant(schwarz_solver->schwarz_solver, HypreSchwarz::RequiredVariant);
    }
 
-   // Configure Schwarz with custom subdomains
-   // use_nonsymm = 0 → Cholesky factorization (symmetric, appropriate for contact)
-   HYPRE_Int use_nonsymm = 0;
-   schwarz_solver->SetCustomSubdomains(subdomains, *PTAP, schwarz_relax_weight, use_nonsymm, schwarz_unweighted, schwarz_uniform_weight);
+   // Configure Schwarz solver and hybrid AMG wrapper based on configuration
+   if (hybrid_amg_wrapper && !hybrid_contact_direct_solver)
+   {
+      // Using hybrid AMG wrapper with Schwarz smoother
+      // Configure Schwarz for use in the smoother
+      HYPRE_Int use_nonsymm = 0;
+      schwarz_solver->SetCustomSubdomains(subdomains, *PTAP, schwarz_relax_weight, use_nonsymm, schwarz_unweighted, schwarz_uniform_weight);
 
-   delete PTAP;
+      hybrid_amg_wrapper->SetSchwarzSmoother(schwarz_solver, subdomains);
+      if (myid == 0 && print_level > 0)
+      {
+         mfem::out << "Configured HypreBoomerAMGWithSchwarzSmoother with "
+                   << subdomains.size() << " Schwarz subdomains" << std::endl;
+      }
+   }
+   else if (hybrid_amg_wrapper && hybrid_contact_direct_solver)
+   {
+      // Using hybrid AMG wrapper with direct solver on contact subspace
+      // Still need to set schwarz_dofs for masking (pass nullptr for schwarz)
+      hybrid_amg_wrapper->SetSchwarzSmoother(nullptr, subdomains);
+      if (myid == 0 && print_level > 0)
+      {
+         mfem::out << "Configured HypreBoomerAMGWithSchwarzSmoother with "
+                   << subdomains.size() << " contact DoFs for direct solver" << std::endl;
+      }
+   }
+   else
+   {
+      // Using AMGF with Schwarz subspace solver
+      // Configure Schwarz with custom subdomains for AMGF
+      HYPRE_Int use_nonsymm = 0;
+      schwarz_solver->SetCustomSubdomains(subdomains, *PTAP, schwarz_relax_weight, use_nonsymm, schwarz_unweighted, schwarz_uniform_weight);
+   }
+
+   // Don't delete PTAP here - it's stored in contact_PTAP and reused
    delete D;
 }
 
@@ -929,9 +996,26 @@ void IPSolver::IPNewtonSolve(BlockVector &x, Vector &l,
    HypreParMatrix *Areduced = ParAdd(Huu, JuTDJu);  // Huu + Ju^T D Ju
 
    // Build Schwarz subdomains from current J matrix
-   if (use_schwarz_subspace)
+   // Needed for: (1) AMGF with Schwarz subspace solver, or (2) Hybrid AMG
+   if (use_schwarz_subspace || hybrid_amg_wrapper)
    {
       BuildSchwarzSubdomains(Areduced, x);
+
+      // If using hybrid AMG wrapper, configure its contact solver and set operator
+      if (hybrid_amg_wrapper)
+      {
+         if (hybrid_contact_direct_solver)
+         {
+            // Using direct solver on contact subspace
+            // Use the cached transfer operator P that was built in BuildSchwarzSubdomains
+            // (Don't call problem->GetContactSubspaceTransferOperator() again as it may be stale)
+            MFEM_VERIFY(contact_transfer_P, "Transfer operator P must be set in BuildSchwarzSubdomains");
+            hybrid_amg_wrapper->SetDirectContactSolver(hybrid_contact_direct_solver, contact_transfer_P, contact_PTAP);
+         }
+         // else: using Schwarz smoother (already set via SetSchwarzSmoother in BuildSchwarzSubdomains)
+
+         hybrid_amg_wrapper->SetOperator(*Areduced);
+      }
    }
 
    /* compute the reduced rhs */
@@ -1085,6 +1169,7 @@ void IPSolver::IPNewtonSolve(BlockVector &x, Vector &l,
    {
       // Standard solve on full system
       solver->SetOperator(*Areduced);
+
       const double linear_solve_start = MPI_Wtime();
       solver->Mult(breduced, Xhat.GetBlock(0));
       const double linear_solve_elapsed_local = MPI_Wtime() - linear_solve_start;
@@ -1092,6 +1177,29 @@ void IPSolver::IPNewtonSolve(BlockVector &x, Vector &l,
       MPI_Allreduce(&linear_solve_elapsed_local, &linear_solve_elapsed, 1,
                     MPI_DOUBLE, MPI_MAX, comm);
       lin_solver_times.Append(linear_solve_elapsed);
+
+            // Test if AMGF preconditioner is SPD (first iteration only)
+      if (test_spd && iter == 1 && preconditioner)
+      {
+         auto amgf = dynamic_cast<AMGFSolver*>(preconditioner);
+         if (amgf)
+         {
+            if (myid == 0)
+            {
+               mfem::out << "\n=== Testing AMGF Preconditioner SPD Property ===" << std::endl;
+            }
+            amgf->VerifyOperatorFormulations(test_spd_num_tests, 24, true);
+            bool is_spd = amgf->TestSPD(test_spd_num_tests);
+            if (myid == 0)
+            {
+               mfem::out << "AMGF preconditioner is " << (is_spd ? "SPD" : "NOT SPD") << std::endl;
+            }
+         }
+         else if (myid == 0)
+         {
+            mfem::out << "Warning: -test-spd requested but preconditioner is not AMGFSolver" << std::endl;
+         }
+      }
    }
 
    if (lobpcg)

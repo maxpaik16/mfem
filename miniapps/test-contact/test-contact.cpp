@@ -66,6 +66,10 @@ enum problem_name
 
 Mesh * GetProblemMesh(problem_name prob_name);
 
+// Refine elements adjacent to contact boundaries (identified by attributes)
+void RefineContactRegion(Mesh &mesh, const std::set<int> &contact_bdr_attr,
+                         int nlevels);
+
 int main(int argc, char *argv[])
 {
 #ifdef MFEM_USE_SINGLE
@@ -85,6 +89,8 @@ int main(int argc, char *argv[])
    int sref = 1;
    // Number of parallel uniform refinements
    int pref = 0;
+   // Number of contact region refinements
+   int contact_ref = 0;
    // Enable/disable GLVis visualization
    bool visualization = true;
    // Enable/disable ParaView output
@@ -102,6 +108,9 @@ int main(int argc, char *argv[])
    // Enable/disable AMGF preconditioner (default is AMG)
    bool amgf = false;
 
+   // Enable/disable reversed order for AMGF (subspace -> AMG -> subspace)
+   bool amgf_reversed = false;
+
    // Direct solver for AMGF filtered subspace
    // Choices:"auto", "mumps", "cpardiso", "superlu", "strumpack"
    const char *amgf_fsolver = "auto";
@@ -118,8 +127,16 @@ int main(int argc, char *argv[])
    real_t schwarz_uniform_weight = -1.0;
    int subspace_print_level = 0;
 
+   // Hybrid Schwarz/GS AMG smoother option
+   bool use_hybrid_amg_smoother = false;
+   bool hybrid_amg_zero_contact_dofs = true;
+
    // Schur complement solver option
    bool use_schur_complement = false;
+
+   // SPD testing option
+   bool test_spd = false;
+   int test_spd_num_tests = 20;
 
    // 1. Parse command-line options.
    OptionsParser args(argc, argv);
@@ -138,8 +155,13 @@ int main(int argc, char *argv[])
                   "Number of extra steps.");
    args.AddOption(&pref, "-pr", "--parallel-refinements",
                   "Number of uniform refinements.");
+   args.AddOption(&contact_ref, "-cr", "--contact-refinements",
+                  "Number of refinement levels in contact regions.");
    args.AddOption(&amgf, "-amgf", "--amgf", "-no-amgf",
                   "--no-amgf", "Enable or disable AMG with Filtering solver.");
+   args.AddOption(&amgf_reversed, "-amgf-reversed", "--amgf-reversed",
+                  "-no-amgf-reversed", "--no-amgf-reversed",
+                  "Enable or disable reversed order for AMGF (subspace -> AMG -> subspace).");
    args.AddOption(&amgf_fsolver, "-amgf-fsolver", "--amgf-filtered-solver",
                   "Direct solver for AMGF filtered subspace.\n"
                   "Choices: auto, mumps, cpardiso, superlu, strumpack.");
@@ -174,9 +196,20 @@ int main(int argc, char *argv[])
                   "Set uniform weight for all DOFs in Schwarz preconditioner (overrides per-DOF scaling; -1 to disable).");
    args.AddOption(&subspace_print_level, "-subspace-pl", "--subspace-print-level",
                   "Print level for Schwarz/direct filtered-subspace solves (0=quiet, 1=timings, 2=timings+Schwarz residuals).");
+   args.AddOption(&use_hybrid_amg_smoother, "-hybrid-amg", "--hybrid-amg-smoother",
+                  "-no-hybrid-amg", "--no-hybrid-amg-smoother",
+                  "Use hybrid Schwarz/GS AMG smoother (requires -amgf and -schwarz).");
+   args.AddOption(&hybrid_amg_zero_contact_dofs, "-hybrid-zero-contact", "--hybrid-zero-contact-dofs",
+                  "-no-hybrid-zero-contact", "--no-hybrid-zero-contact-dofs",
+                  "Zero out contact DoF rows/columns in GS smoother matrix (default: true).");
    args.AddOption(&use_schur_complement, "-schur", "--use-schur-complement",
                   "-no-schur", "--no-use-schur-complement",
                   "Use Schur complement reduction with pure AMG-preconditioned CG.");
+   args.AddOption(&test_spd, "-test-spd", "--test-spd",
+                  "-no-test-spd", "--no-test-spd",
+                  "Test if AMGF preconditioner is SPD using random vectors (requires -amgf).");
+   args.AddOption(&test_spd_num_tests, "-test-spd-num-tests", "--test-spd-num-tests",
+                  "Number of random vector tests for SPD testing.");
 
    args.Parse();
    if (!args.Good())
@@ -231,6 +264,27 @@ int main(int argc, char *argv[])
       schwarz_variant = 2;
    }
 
+   // Validate test_spd requires AMGF
+   if (test_spd && !amgf)
+   {
+      if (myid == 0)
+      {
+         cout << "SPD testing requires -amgf flag." << endl;
+      }
+      return 1;
+   }
+
+   // Validate hybrid AMG smoother requires AMGF
+   // -schwarz uses Schwarz smoother, -no-schwarz uses direct solver on contact subspace
+   if (use_hybrid_amg_smoother && !amgf)
+   {
+      if (myid == 0)
+      {
+         cout << "Hybrid AMG smoother (-hybrid-amg) requires -amgf flag." << endl;
+      }
+      return 1;
+   }
+
    // Validate Schur complement and AMGF are mutually exclusive
    if (use_schur_complement && amgf)
    {
@@ -253,6 +307,31 @@ int main(int argc, char *argv[])
    for (int i = 0; i<sref; i++)
    {
       mesh->UniformRefinement();
+   }
+
+   // 3a. Determine contact boundary attributes for this problem.
+   std::set<int> contact_bdr_attr_for_ref;
+   switch (prob_name)
+   {
+      case twoblock:
+      case ironing:
+         contact_bdr_attr_for_ref.insert(3);
+         contact_bdr_attr_for_ref.insert(4);
+         break;
+      case beamsphere:
+         contact_bdr_attr_for_ref.insert(6);
+         contact_bdr_attr_for_ref.insert(7);
+         contact_bdr_attr_for_ref.insert(8);
+         contact_bdr_attr_for_ref.insert(9);
+         break;
+      default:
+         break;
+   }
+
+   // 3b. Apply contact-region refinement on serial mesh.
+   if (contact_ref > 0 && !contact_bdr_attr_for_ref.empty())
+   {
+      RefineContactRegion(*mesh, contact_bdr_attr_for_ref, contact_ref);
    }
 
    // 4. Convert to ParMesh and refine in parallel.
@@ -466,14 +545,48 @@ int main(int argc, char *argv[])
 #endif
 
       HypreSchwarz* schwarz_ptr = nullptr;
+      HypreBoomerAMGWithSchwarzSmoother* hybrid_amg_wrapper = nullptr;
 
-      if (amgf)
+      if (use_hybrid_amg_smoother)
+      {
+         // Create base AMG
+         HypreBoomerAMG* base_amg = new HypreBoomerAMG();
+         base_amg->SetSystemsOptions(3);
+         base_amg->SetPrintLevel(0);
+         base_amg->SetRelaxType(amg_relax_type);
+
+         // Create hybrid AMG wrapper (takes ownership of base_amg)
+         hybrid_amg_wrapper = new HypreBoomerAMGWithSchwarzSmoother(base_amg, true,
+                                                                     hybrid_amg_zero_contact_dofs);
+
+         if (!use_schwarz)
+         {
+            // Use direct solver on contact subspace (when -no-schwarz is specified)
+            auto* direct_solver = new ParallelDirectSolver(MPI_COMM_WORLD, amgf_fsolver);
+            direct_solver->SetPrintLevel(subspace_print_level);
+            subspacesolver = direct_solver;
+            // Note: SetOperator will only be called once on this solver to avoid SuperLU errors
+         }
+         else
+         {
+            // Use Schwarz solver for the smoother (when -schwarz is specified)
+            schwarz_ptr = new HypreSchwarz();
+            schwarz_ptr->SetPrintLevel(subspace_print_level);
+         }
+
+         prec = hybrid_amg_wrapper;
+      }
+      else if (amgf)
       {
          prec = new AMGFSolver();
          auto * amgfprec = dynamic_cast<AMGFSolver *>(prec);
+
          amgfprec->GetAMG().SetSystemsOptions(3);
          amgfprec->GetAMG().SetPrintLevel(0);
          amgfprec->GetAMG().SetRelaxType(amg_relax_type);
+
+         amgfprec->SetPrintLevel(subspace_print_level);
+         amgfprec->SetReversedOrder(amgf_reversed);
 
          if (use_schwarz)
          {
@@ -532,18 +645,33 @@ int main(int argc, char *argv[])
       IPSolver optimizer(&contact);
       optimizer.SetTol(1e-6);
       optimizer.SetMaxIter(100);
+      // cgsolver.SetPrintLevel(1);
       optimizer.SetLinearSolver(&cgsolver);
+      optimizer.SetPreconditioner(prec);
       optimizer.SetPrintLevel(0);
       optimizer.SetSchwarzOptions(use_schwarz, schwarz_expand_neighbors,
                                   schwarz_cg_iters, schwarz_weight, schwarz_variant,
                                   schwarz_min_diag_value,
                                   schwarz_examine_diagonal, schwarz_unweighted, schwarz_uniform_weight);
       optimizer.SetSchurComplementMode(use_schur_complement);
+      optimizer.SetTestSPD(test_spd, test_spd_num_tests);
 
-      // Pass Schwarz solver to optimizer if using Schwarz
-      if (use_schwarz && amgf)
+      // Pass Schwarz solver to optimizer if using Schwarz (for AMGF or hybrid AMG)
+      if (schwarz_ptr)
       {
          optimizer.SetSchwarzSolver(schwarz_ptr);
+      }
+
+      // Pass hybrid AMG wrapper to optimizer if using it
+      if (use_hybrid_amg_smoother && hybrid_amg_wrapper)
+      {
+         optimizer.SetHybridAMGWrapper(hybrid_amg_wrapper);
+
+         // If using direct solver on contact subspace (when -no-schwarz), pass it to optimizer
+         if (!use_schwarz && subspacesolver)
+         {
+            optimizer.SetHybridContactDirectSolver(subspacesolver);
+         }
       }
 
       // Initial guess = previous reference configuration.
@@ -556,8 +684,17 @@ int main(int argc, char *argv[])
       Vector xf(ndofs); xf = 0.0;
       optimizer.Mult(x0, xf);
 
-      delete prec;
-      if (subspacesolver) { delete subspacesolver; }
+      // Note: prec and hybrid_amg_wrapper are the same pointer when using hybrid AMG
+      if (use_hybrid_amg_smoother)
+      {
+         delete prec;  // This deletes the hybrid_amg_wrapper
+         if (schwarz_ptr) { delete schwarz_ptr; }
+      }
+      else
+      {
+         delete prec;
+         if (subspacesolver) { delete subspacesolver; }
+      }
 
       // Update internal state for next step (for bound constraints).
       Vector dx(xf); dx -= x0;
@@ -632,6 +769,40 @@ int main(int argc, char *argv[])
    // 10. Cleanup.
    if (paraview_dc) { delete paraview_dc; }
    return 0;
+}
+
+void RefineContactRegion(Mesh &mesh, const std::set<int> &contact_bdr_attr,
+                         int nlevels)
+{
+   for (int level = 0; level < nlevels; level++)
+   {
+      Array<int> elements_to_refine;
+
+      // Mark elements adjacent to contact boundaries
+      for (int i = 0; i < mesh.GetNBE(); i++)
+      {
+         int bdr_attr = mesh.GetBdrAttribute(i);
+         if (contact_bdr_attr.find(bdr_attr) != contact_bdr_attr.end())
+         {
+            int elem_id, face_info;
+            mesh.GetBdrElementAdjacentElement(i, elem_id, face_info);
+
+            if (elem_id >= 0)
+            {
+               elements_to_refine.Append(elem_id);
+            }
+         }
+      }
+
+      // Remove duplicates
+      elements_to_refine.Sort();
+      elements_to_refine.Unique();
+
+      if (elements_to_refine.Size() > 0)
+      {
+         mesh.GeneralRefinement(elements_to_refine, 1);
+      }
+   }
 }
 
 Mesh * GetProblemMesh(problem_name prob_name)

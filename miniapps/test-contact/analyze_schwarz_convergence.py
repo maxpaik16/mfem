@@ -19,60 +19,98 @@ import argparse
 
 def read_mfem_matrix(filename):
     """
-    Read a matrix from MFEM .mat format.
+    Read a matrix from MFEM .mat format (supports both single and multi-rank files).
 
     MFEM parallel format:
     - First line: row_start row_end col_start nnz
     - Subsequent lines: row col value (space-separated)
 
+    For multi-rank files, reads all files matching the pattern filename.XXXXX
+    where XXXXX is the rank number (00000, 00001, etc.).
+
     Args:
-        filename: Path to .mat file
+        filename: Path to .mat file (can be with or without .00000 suffix)
 
     Returns:
         scipy sparse matrix
     """
-    with open(filename, 'r') as f:
-        lines = f.readlines()
+    from pathlib import Path
+    import glob
 
-    # Skip empty lines
-    data_lines = [line.strip() for line in lines if line.strip()]
+    filepath = Path(filename)
 
-    # Parse header: row_start row_end col_start nnz
-    header = data_lines[0].split()
-    row_start = int(header[0])
-    row_end = int(header[1])
-    col_start = int(header[2])
-    nnz = int(header[3])
-
-    nrows_local = row_end - row_start
-
-    # Parse entries: row col value
-    rows = []
-    cols = []
-    data = []
-
-    for line in data_lines[1:]:
-        parts = line.split()
-        if len(parts) >= 3:
-            # MFEM outputs global row/col indices
-            row = int(parts[0])
-            col = int(parts[1])
-            val = float(parts[2])
-
-            rows.append(row)
-            cols.append(col)
-            data.append(val)
-
-    # Determine matrix dimensions from actual data
-    if len(rows) > 0:
-        nrows = max(rows) + 1
-        ncols = max(cols) + 1
+    # Check if this is a single-rank file or needs multi-rank handling
+    if filepath.exists():
+        # Single file case
+        rank_files = [filepath]
     else:
-        nrows = nrows_local
-        ncols = col_start
+        # Multi-rank case: find all rank files
+        # Remove any existing rank suffix if present
+        base_path = str(filepath)
+        if base_path.endswith('.00000'):
+            base_path = base_path[:-6]
+
+        # Find all rank files matching pattern
+        rank_files = sorted(glob.glob(f"{base_path}.*"))
+
+        if not rank_files:
+            raise FileNotFoundError(f"No matrix files found for pattern: {base_path}.*")
+
+    # Collect data from all ranks
+    all_rows = []
+    all_cols = []
+    all_data = []
+    max_row = -1
+    max_col = -1
+
+    for rank_file in rank_files:
+        with open(rank_file, 'r') as f:
+            lines = f.readlines()
+
+        # Skip empty lines
+        data_lines = [line.strip() for line in lines if line.strip()]
+
+        if not data_lines:
+            continue
+
+        # Parse header: row_start row_end col_start nnz
+        header = data_lines[0].split()
+        row_start = int(header[0])
+        row_end = int(header[1])
+        col_start = int(header[2])
+        nnz = int(header[3])
+
+        # Skip empty ranks (indicated by row_end = -1 or nnz = -1)
+        if row_end == -1 or nnz == -1:
+            continue
+
+        # Parse entries: row col value
+        for line in data_lines[1:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                # MFEM outputs global row/col indices
+                row = int(parts[0])
+                col = int(parts[1])
+                val = float(parts[2])
+
+                all_rows.append(row)
+                all_cols.append(col)
+                all_data.append(val)
+
+                max_row = max(max_row, row)
+                max_col = max(max_col, col)
+
+    # Determine matrix dimensions
+    if len(all_rows) > 0:
+        nrows = max_row + 1
+        ncols = max_col + 1
+    else:
+        # Empty matrix
+        nrows = 0
+        ncols = 0
 
     # Convert to scipy sparse matrix (CSR format)
-    return sp.csr_matrix((data, (rows, cols)), shape=(nrows, ncols))
+    return sp.csr_matrix((all_data, (all_rows, all_cols)), shape=(nrows, ncols))
 
 
 def build_subdomains_from_J(J, P, min_diag_value=0.0, D_diag=None, debug=False):
@@ -577,11 +615,11 @@ def main():
 
     mats_dir = Path(args.mats_dir)
 
-    # Construct filenames
-    j_file = mats_dir / f"J_matrix_iter_{args.iteration}.mat.00000"
-    d_file = mats_dir / f"D_matrix_iter_{args.iteration}.mat.00000"
-    p_file = mats_dir / f"P_matrix_iter_{args.iteration}.mat.00000"
-    ptap_file = mats_dir / f"PTAP_matrix_iter_{args.iteration}.mat.00000"
+    # Construct filenames (base names without rank suffix for multi-rank support)
+    j_file = mats_dir / f"J_matrix_iter_{args.iteration}.mat"
+    d_file = mats_dir / f"D_matrix_iter_{args.iteration}.mat"
+    p_file = mats_dir / f"P_matrix_iter_{args.iteration}.mat"
+    ptap_file = mats_dir / f"PTAP_matrix_iter_{args.iteration}.mat"
 
     print("=" * 70)
     print("Schwarz Preconditioner Convergence Analysis")
@@ -594,17 +632,29 @@ def main():
 
     # Load matrices
     print("Loading matrices...")
-    if not j_file.exists():
-        print(f"Error: J matrix file not found: {j_file}")
+
+    # Check if files exist (either single file or multi-rank files)
+    def check_matrix_exists(base_file):
+        """Check if matrix file exists (single or multi-rank)."""
+        import glob
+        # Check single file
+        if base_file.exists():
+            return True
+        # Check multi-rank files
+        pattern = str(base_file) + ".*"
+        return len(glob.glob(pattern)) > 0
+
+    if not check_matrix_exists(j_file):
+        print(f"Error: J matrix file not found: {j_file} (or {j_file}.*)")
         return
-    if not d_file.exists():
-        print(f"Error: D matrix file not found: {d_file}")
+    if not check_matrix_exists(d_file):
+        print(f"Error: D matrix file not found: {d_file} (or {d_file}.*)")
         return
-    if not p_file.exists():
-        print(f"Error: P matrix file not found: {p_file}")
+    if not check_matrix_exists(p_file):
+        print(f"Error: P matrix file not found: {p_file} (or {p_file}.*)")
         return
-    if not ptap_file.exists():
-        print(f"Error: PTAP matrix file not found: {ptap_file}")
+    if not check_matrix_exists(ptap_file):
+        print(f"Error: PTAP matrix file not found: {ptap_file} (or {ptap_file}.*)")
         return
 
     J = read_mfem_matrix(j_file)

@@ -811,7 +811,9 @@ SparseMatrix BuildPenaltyModifiedMatrix(const HypreParMatrix &A,
                                         const Array<HYPRE_BigInt> &all_tied_gdofs_array,
                                         double alpha,
                                         MPI_Comm comm,
-                                        bool even_weighting = true)
+                                        bool even_weighting = true,
+                                        double diagonal_perturbation_width = 0.0,
+                                        double diagonal_perturbation_center = 0.0)
 {
    const HYPRE_BigInt row_start = A.GetRowStarts()[0];
    const HYPRE_BigInt row_end   = A.GetRowStarts()[1];
@@ -886,30 +888,39 @@ SparseMatrix BuildPenaltyModifiedMatrix(const HypreParMatrix &A,
 
       const real_t w = 1.0 / m;
 
-      // Penalty:
-      // value * (u_i - sum_k w v_k)^2
-
-      emit(global_row, global_row, value);
-
-      for (int k = 0; k < m; ++k)
       {
-         const HYPRE_BigInt vk = group[k];
-         const real_t w = even_weighting ? 1.0 / m : vk == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
-         emit(global_row, vk, -value * w);
-         emit(vk, global_row, -value * w);
-      }
+         emit(global_row, global_row, value);
 
-      for (int k = 0; k < m; ++k)
-      {
-         const HYPRE_BigInt vk = group[k];
-         const real_t wk = even_weighting ? 1.0 / m : vk == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
-         for (int l = 0; l < m; ++l)
+         for (int k = 0; k < m; ++k)
          {
-            const HYPRE_BigInt vl = group[l];
-            const real_t wl = even_weighting ? 1.0 / m : vl == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
-            emit(vk, vl, value * wk * wl);
+            const HYPRE_BigInt vk = group[k];
+            const real_t w = even_weighting ? 1.0 / m : vk == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
+            emit(global_row, vk, -value * w);
+            emit(vk, global_row, -value * w);
+         }
+
+         for (int k = 0; k < m; ++k)
+         {
+            const HYPRE_BigInt vk = group[k];
+            const real_t wk = even_weighting ? 1.0 / m : vk == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
+            for (int l = 0; l < m; ++l)
+            {
+               const HYPRE_BigInt vl = group[l];
+               const real_t wl = even_weighting ? 1.0 / m : vl == paired_gdof ? 0.5 : 0.5 / (static_cast<real_t>(m) - 1.0);
+               emit(vk, vl, value * wk * wl);
+            }
+         }
+
+         if (diagonal_perturbation_width > 0.0)
+         {
+            double center = (diagonal_perturbation_center == 0.0) ? alpha : diagonal_perturbation_center;
+            std::mt19937 rng(global_row);
+            std::uniform_real_distribution<double> dist(center - diagonal_perturbation_width, center + diagonal_perturbation_width);
+            double perturbation = dist(rng);
+            emit(global_row, global_row, perturbation);
          }
       }
+      
    }
 
    std::vector<std::vector<HYPRE_BigInt>> send_rows_by_rank(nranks);
@@ -1127,7 +1138,7 @@ int main(int argc, char *argv[])
 
    MPI_Comm comm = MPI_COMM_WORLD;
 
-   string mesh_file = "../../data/beam-tet.mesh";
+   string mesh_file = "beam-tet.mesh";
    int ref_levels = 4;
    double alpha = 1e3;
    int tied_bdr_attr = 1;
@@ -1148,6 +1159,8 @@ int main(int argc, char *argv[])
    bool symmetric_tie = false;
    bool even_weighting = false;
    bool use_schur_complement = false;
+   double diagonal_perturbation_width = 0.0;
+   double diagonal_perturbation_center = 0.0;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh", "Mesh file to use.");
@@ -1203,6 +1216,10 @@ int main(int argc, char *argv[])
    args.AddOption(&use_schur_complement, "-schur", "--use-schur-complement",
                   "-no-schur", "--no-use-schur-complement",
                   "Use Schur complement reduction with pure AMG-preconditioned CG.");
+   args.AddOption(&diagonal_perturbation_width, "-dp-width", "--diagonal-perturbation-width",
+                  "Width of uniform distribution for diagonal perturbation (0 = disabled).");
+   args.AddOption(&diagonal_perturbation_center, "-dp-center", "--diagonal-perturbation-center",
+                  "Center of uniform distribution for diagonal perturbation (default 0, will use alpha if not set and width > 0).");
    args.ParseCheck();
 
    if (schwarz_subspace_filter && amg_subspace_filter)
@@ -1334,7 +1351,9 @@ int main(int argc, char *argv[])
                                  all_tied_gdofs_array,
                                  alpha,
                                  comm,
-                                 even_weighting);
+                                 even_weighting,
+                                 diagonal_perturbation_width,
+                                 diagonal_perturbation_center);
 
    HypreParMatrix *tiedA = BuildHypreParMatrixFromMerged(modified_A, A);
 

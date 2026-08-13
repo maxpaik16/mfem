@@ -34,6 +34,11 @@ void dpotrs_(char *uplo, int *n, int *nrhs, double *a, int *lda,
              double *b, int *ldb, int *info);
 void dgetrs_(const char *trans, int *n, int *nrhs, double *a, int *lda,
              int *ipiv, double *b, int *ldb, int *info);
+void dsyev_(const char *jobz, const char *uplo, const int *n, double *a,
+            const int *lda, double *w, double *work, const int *lwork, int *info);
+void dgeev_(const char *jobvl, const char *jobvr, const int *n, double *a,
+            const int *lda, double *wr, double *wi, double *vl, const int *ldvl,
+            double *vr, const int *ldvr, double *work, const int *lwork, int *info);
 
 typedef struct
 {
@@ -840,6 +845,80 @@ public:
 
          if (n > 0)
          {
+            // Eigendecomposition diagnostics (before factorization)
+            if (print_level > 0)
+            {
+               std::vector<HYPRE_Real> AE_copy(n * n);
+               std::copy(AE, AE + n * n, AE_copy.begin());
+
+               int nn = (int)n;
+               int info = 0;
+               bool has_negative = false;
+               HYPRE_Real min_abs_eval = 1e100, max_abs_eval = -1e100;
+
+               if (custom_use_nonsymm)
+               {
+                  // General eigenvalue problem
+                  std::vector<HYPRE_Real> wr(n), wi(n);
+                  int lwork = 4 * nn;
+                  std::vector<HYPRE_Real> work(lwork);
+                  char jobvl = 'N', jobvr = 'N';
+
+                  dgeev_(&jobvl, &jobvr, &nn, AE_copy.data(), &nn,
+                         wr.data(), wi.data(), nullptr, &nn, nullptr, &nn,
+                         work.data(), &lwork, &info);
+
+                  if (info == 0)
+                  {
+                     for (int i = 0; i < n; ++i)
+                     {
+                        HYPRE_Real eval_mag = std::sqrt(wr[i]*wr[i] + wi[i]*wi[i]);
+                        if (eval_mag < min_abs_eval) min_abs_eval = eval_mag;
+                        if (eval_mag > max_abs_eval) max_abs_eval = eval_mag;
+                        if (wr[i] < 0.0 && std::abs(wi[i]) < 1e-14) has_negative = true;
+                     }
+
+                     if (myrank == 0)
+                     {
+                        mfem::out << "Subdomain " << d << " (size=" << n << "): ";
+                        if (has_negative) mfem::out << "HAS NEGATIVE EIGENVALUES, ";
+                        mfem::out << "min|eval|=" << min_abs_eval
+                                  << ", max|eval|=" << max_abs_eval << std::endl;
+                     }
+                  }
+               }
+               else
+               {
+                  // Symmetric eigenvalue problem
+                  std::vector<HYPRE_Real> w(n);
+                  int lwork = 3 * nn;
+                  std::vector<HYPRE_Real> work(lwork);
+                  char jobz = 'N';
+
+                  dsyev_(&jobz, &uplo, &nn, AE_copy.data(), &nn, w.data(),
+                         work.data(), &lwork, &info);
+
+                  if (info == 0)
+                  {
+                     for (int i = 0; i < n; ++i)
+                     {
+                        HYPRE_Real eval_abs = std::abs(w[i]);
+                        if (eval_abs < min_abs_eval) min_abs_eval = eval_abs;
+                        if (eval_abs > max_abs_eval) max_abs_eval = eval_abs;
+                        if (w[i] < 0.0) has_negative = true;
+                     }
+
+                     if (myrank == 0)
+                     {
+                        mfem::out << "Subdomain " << d << " (size=" << n << "): ";
+                        if (has_negative) mfem::out << "HAS NEGATIVE EIGENVALUES, ";
+                        mfem::out << "min|eval|=" << min_abs_eval
+                                  << ", max|eval|=" << max_abs_eval << std::endl;
+                     }
+                  }
+               }
+            }
+
             int info = 0;
             int nn = (int)n;
             if (custom_use_nonsymm)
@@ -918,6 +997,538 @@ public:
       return (HYPRE_PtrToParSolverFcn) +wrapped_solve;
    }
    using HypreSolver::Mult;
+};
+
+/// Wrapper around HypreBoomerAMG with custom smoother combining Schwarz and Gauss-Seidel
+class HypreBoomerAMGWithSchwarzSmoother : public HypreSolver
+{
+private:
+   HypreBoomerAMG *amg;
+   HypreSchwarz *schwarz_smoother;
+   HypreSmoother *gs_smoother;
+   Solver *contact_solver;  // Either Schwarz or direct solver
+   bool owns_amg;
+   bool use_direct_contact_solver;
+
+   // Track which DoFs are touched by Schwarz
+   std::set<HYPRE_BigInt> schwarz_dofs;
+
+   // Temporary vectors for smoothing
+   mutable HypreParVector *temp_residual;
+   mutable HypreParVector *temp_correction;
+
+   // Modified matrix with contact DoF rows/columns zeroed
+   HypreParMatrix *masked_matrix;
+
+   // Option to skip zeroing contact DoFs in the masked matrix
+   bool zero_contact_dofs;
+
+   // Transfer operator for direct contact solver (not owned)
+   HypreParMatrix *transfer_operator;  // Transfer operator P mapping contact subspace to full space
+
+public:
+   /// Constructor taking ownership of an existing BoomerAMG instance
+   HypreBoomerAMGWithSchwarzSmoother(HypreBoomerAMG *boomeramg, bool take_ownership = true,
+                                      bool zero_contact_dofs_in_gs = true)
+      : amg(boomeramg), schwarz_smoother(nullptr), gs_smoother(nullptr),
+        contact_solver(nullptr), owns_amg(take_ownership), use_direct_contact_solver(false),
+        temp_residual(nullptr), temp_correction(nullptr),
+        masked_matrix(nullptr), zero_contact_dofs(zero_contact_dofs_in_gs),
+        transfer_operator(nullptr)
+   {
+      MFEM_VERIFY(amg, "BoomerAMG pointer cannot be null");
+
+      // Note: We disable finest level sweeps in SetOperator (after amg->SetOperator is called)
+      // Cannot call HYPRE_BoomerAMGSetNumGridSweeps here in constructor before operator is set
+   }
+
+   /// Set the Schwarz smoother and the DoFs it will operate on
+   /// Pass schwarz=nullptr when using direct solver (DoFs are still needed for masking)
+   /// NOTE: This only stores the smoother and DoFs. The operator will be set
+   /// when SetOperator is called on the wrapper.
+   void SetSchwarzSmoother(HypreSchwarz *schwarz,
+                           const std::vector<std::vector<HYPRE_BigInt>> &subdomains)
+   {
+      schwarz_smoother = schwarz;
+      if (schwarz)
+      {
+         contact_solver = schwarz;
+         use_direct_contact_solver = false;
+      }
+
+      // Build set of all DoFs touched by contact solver (Schwarz or direct)
+      schwarz_dofs.clear();
+      for (const auto &subdomain : subdomains)
+      {
+         for (HYPRE_BigInt dof : subdomain)
+         {
+            schwarz_dofs.insert(dof);
+         }
+      }
+
+      // Note: We don't call schwarz_smoother->SetOperator here because A might be stale.
+      // Instead, SetOperator on the wrapper will configure schwarz_smoother after updating A.
+   }
+
+   /// Set a direct solver for the contact subspace
+   /// @param direct_solver The solver for the contact subspace (not owned)
+   /// @param P_transfer Transfer operator P mapping contact subspace to full space (not owned)
+   /// @param PTAP_submatrix The projected operator P^T A P (not owned)
+   /// The direct solver's operator must be set externally to PTAP_submatrix
+   void SetDirectContactSolver(Solver *direct_solver,
+                               const HypreParMatrix *P_transfer,
+                               const HypreParMatrix *PTAP_submatrix)
+   {
+      MFEM_VERIFY(direct_solver, "Direct solver cannot be null");
+      MFEM_VERIFY(P_transfer, "Transfer operator cannot be null");
+
+      contact_solver = direct_solver;
+      use_direct_contact_solver = true;
+      schwarz_smoother = nullptr;
+      transfer_operator = const_cast<HypreParMatrix*>(P_transfer);
+
+      // Set the PTAP operator on the direct solver
+      // PTAP changes every iteration, so we must call SetOperator each time
+      if (PTAP_submatrix)
+      {
+         contact_solver->SetOperator(*PTAP_submatrix);
+      }
+
+      // Extract contact DoFs from transfer operator structure
+      ExtractContactDoFsFromTransfer(P_transfer);
+
+      // If the full-space operator has already been set, configure masked matrix
+      if (A)
+      {
+         SetupMaskedMatrix();
+      }
+   }
+
+
+   void SetOperator(const Operator &op) override
+   {
+      const HypreParMatrix *new_A = dynamic_cast<const HypreParMatrix *>(&op);
+      MFEM_VERIFY(new_A, "new Operator must be a HypreParMatrix!");
+
+      // Update base class members
+      height = new_A->Height();
+      width  = new_A->Width();
+      A = const_cast<HypreParMatrix *>(new_A);
+      setup_called = 0;
+      delete X;
+      delete B;
+      B = X = NULL;
+      auxB.Delete(); auxB.Reset();
+      auxX.Delete(); auxX.Reset();
+
+      // Update AMG operator
+      amg->SetOperator(op);
+
+      // Disable finest level sweeps - the hybrid smoother handles the finest level
+      //HYPRE_BoomerAMGSetNumSweeps(*amg, 0);
+      //HYPRE_BoomerAMGSetCycleNumSweeps(*amg, 1, 1);
+      //HYPRE_BoomerAMGSetCycleNumSweeps(*amg, 1, 2);
+      //HYPRE_BoomerAMGSetCycleNumSweeps(*amg, 1, 3);
+
+      //HYPRE_Int *sweeps = (HYPRE_Int*) malloc(4 * sizeof(*sweeps));
+      //sweeps[0] = 0;
+      //sweeps[1] = 1;
+      //sweeps[2] = 1;
+      //sweeps[3] = 1;
+      //HYPRE_BoomerAMGSetNumGridSweeps(*amg, sweeps);
+      HYPRE_BoomerAMGSetLevelRelaxWt(*amg, 0.0, 0);
+
+      // Update contact solver operator if it has been configured
+      if (schwarz_smoother)
+      {
+         // Set operator on the Schwarz smoother
+         schwarz_smoother->SetOperator(*new_A);
+         SetupMaskedMatrix();
+      }
+      else if (use_direct_contact_solver)
+      {
+         // For direct solver, just set up masked matrix and GS smoother
+         // The direct solver operator (P^T A P) must be set externally
+         SetupMaskedMatrix();
+      }
+   }
+
+   void Mult(const HypreParVector &b, HypreParVector &x) const override
+   {
+      MFEM_VERIFY(A, "Operator must be set before calling Mult");
+      MFEM_VERIFY(contact_solver, "Contact solver must be set (either Schwarz or direct)");
+      MFEM_VERIFY(gs_smoother, "GS smoother must be initialized");
+      if (use_direct_contact_solver)
+      {
+         MFEM_VERIFY(transfer_operator, "Transfer operator must be set for direct contact solver");
+      }
+
+      // Initialize x to zero if not in iterative mode
+      if (!iterative_mode)
+      {
+         x.HypreWrite();
+         hypre_ParVectorSetConstantValues(x, 0.0);
+      }
+
+      // Apply hybrid contact/GS pre-smoothing
+      ApplyHybridSmoother(b, x);
+
+      // Clear HYPRE's global error flag in case ParallelDirectSolver corrupted it
+      hypre_error_flag = 0;
+
+      // Apply BoomerAMG (with disabled finest level sweeps)
+      // AMG's Mult will call Setup automatically if needed
+      amg->Mult(b, x);
+
+      // Apply hybrid contact/GS post-smoothing
+      ApplyHybridSmoother(b, x);
+   }
+
+private:
+   /// Extract contact DoFs from the transfer operator P
+   /// P is a matrix of size (num_displacement_dofs × num_contact_dofs)
+   /// where each column corresponds to a contact DoF in the full space
+   void ExtractContactDoFsFromTransfer(const HypreParMatrix *P_transfer)
+   {
+      schwarz_dofs.clear();
+
+      if (!P_transfer) return;
+
+      hypre_ParCSRMatrix *parP = (hypre_ParCSRMatrix *)(*P_transfer);
+      hypre_CSRMatrix *P_diag = hypre_ParCSRMatrixDiag(parP);
+      hypre_CSRMatrix *P_offd = hypre_ParCSRMatrixOffd(parP);
+
+      HYPRE_BigInt local_row_start = hypre_ParCSRMatrixFirstRowIndex(parP);
+      HYPRE_Int local_num_rows = hypre_CSRMatrixNumRows(P_diag);
+      HYPRE_BigInt *col_map_offd = hypre_ParCSRMatrixColMapOffd(parP);
+
+      HYPRE_Int *P_diag_i = hypre_CSRMatrixI(P_diag);
+      HYPRE_Int *P_diag_j = hypre_CSRMatrixJ(P_diag);
+      HYPRE_Int *P_offd_i = hypre_CSRMatrixI(P_offd);
+      HYPRE_Int *P_offd_j = hypre_CSRMatrixJ(P_offd);
+
+      // Collect all DoFs that have nonzero entries in P (these are contact DoFs)
+      for (HYPRE_Int i = 0; i < local_num_rows; ++i)
+      {
+         HYPRE_BigInt global_row = local_row_start + i;
+         bool has_contact_entry = false;
+
+         // Check diagonal block
+         for (HYPRE_Int jj = P_diag_i[i]; jj < P_diag_i[i + 1]; ++jj)
+         {
+            if (std::abs(hypre_CSRMatrixData(P_diag)[jj]) > 1e-14)
+            {
+               has_contact_entry = true;
+               break;
+            }
+         }
+
+         // Check off-diagonal block if needed
+         if (!has_contact_entry)
+         {
+            for (HYPRE_Int jj = P_offd_i[i]; jj < P_offd_i[i + 1]; ++jj)
+            {
+               if (std::abs(hypre_CSRMatrixData(P_offd)[jj]) > 1e-14)
+               {
+                  has_contact_entry = true;
+                  break;
+               }
+            }
+         }
+
+         if (has_contact_entry)
+         {
+            schwarz_dofs.insert(global_row);
+         }
+      }
+   }
+
+   /// Setup masked matrix and temporary vectors
+   void SetupMaskedMatrix()
+   {
+      MFEM_VERIFY(A, "Operator must be set before setting up masked matrix");
+
+      if (masked_matrix)
+      {
+         delete masked_matrix;
+      }
+      masked_matrix = new HypreParMatrix(*A);
+      if (zero_contact_dofs)
+      {
+         ZeroContactDoFsInMatrix(*masked_matrix);
+      }
+
+      if (gs_smoother)
+      {
+         delete gs_smoother;
+      }
+      gs_smoother = new HypreSmoother(*masked_matrix, HypreSmoother::l1GS, 1);
+
+      if (temp_residual)
+      {
+         delete temp_residual;
+         delete temp_correction;
+      }
+      temp_residual = new HypreParVector(*A, 0);
+      temp_correction = new HypreParVector(*A, 0);
+   }
+
+   /// Zero out all matrix entries in rows or columns corresponding to Schwarz DoFs
+   /// Set diagonal to 1.0 for contact DoF rows
+   void ZeroContactDoFsInMatrix(HypreParMatrix &mat)
+   {
+      hypre_ParCSRMatrix *parA = (hypre_ParCSRMatrix *)mat;
+      hypre_CSRMatrix *A_diag = hypre_ParCSRMatrixDiag(parA);
+      hypre_CSRMatrix *A_offd = hypre_ParCSRMatrixOffd(parA);
+
+      HYPRE_BigInt local_row_start = hypre_ParCSRMatrixFirstRowIndex(parA);
+      HYPRE_Int local_num_rows = hypre_CSRMatrixNumRows(A_diag);
+
+      HYPRE_Int *diag_i = hypre_CSRMatrixI(A_diag);
+      HYPRE_Int *diag_j = hypre_CSRMatrixJ(A_diag);
+      HYPRE_Real *diag_data = hypre_CSRMatrixData(A_diag);
+
+      HYPRE_Int *offd_i = hypre_CSRMatrixI(A_offd);
+      HYPRE_Int *offd_j = hypre_CSRMatrixJ(A_offd);
+      HYPRE_Real *offd_data = hypre_CSRMatrixData(A_offd);
+      HYPRE_BigInt *col_map_offd = hypre_ParCSRMatrixColMapOffd(parA);
+      HYPRE_Int num_cols_offd = hypre_CSRMatrixNumCols(A_offd);
+
+      // Build set of local Schwarz column indices
+      std::set<HYPRE_Int> local_schwarz_cols;
+      for (HYPRE_BigInt gdof : schwarz_dofs)
+      {
+         if (gdof >= local_row_start && gdof < local_row_start + local_num_rows)
+         {
+            local_schwarz_cols.insert(static_cast<HYPRE_Int>(gdof - local_row_start));
+         }
+      }
+
+      // Build set of offd Schwarz column indices
+      std::set<HYPRE_Int> offd_schwarz_cols;
+      for (HYPRE_Int j = 0; j < num_cols_offd; ++j)
+      {
+         if (schwarz_dofs.count(col_map_offd[j]) > 0)
+         {
+            offd_schwarz_cols.insert(j);
+         }
+      }
+
+      // Zero out rows and columns in diagonal block, set diagonal to 1.0 for contact DoFs
+      for (HYPRE_Int i = 0; i < local_num_rows; ++i)
+      {
+         HYPRE_BigInt global_row = local_row_start + i;
+         bool is_schwarz_row = schwarz_dofs.count(global_row) > 0;
+
+         for (HYPRE_Int jj = diag_i[i]; jj < diag_i[i + 1]; ++jj)
+         {
+            HYPRE_Int j = diag_j[jj];
+            bool is_schwarz_col = local_schwarz_cols.count(j) > 0;
+
+            if (is_schwarz_row)
+            {
+               // Contact row: zero all entries except diagonal which is set to 1.0
+               if (i == j)
+               {
+                  diag_data[jj] = 1.0;
+               }
+               else
+               {
+                  diag_data[jj] = 0.0;
+               }
+            }
+            else if (is_schwarz_col)
+            {
+               // Non-contact row but contact column: zero the entry
+               diag_data[jj] = 0.0;
+            }
+         }
+      }
+
+      // Zero out rows and columns in off-diagonal block
+      for (HYPRE_Int i = 0; i < local_num_rows; ++i)
+      {
+         HYPRE_BigInt global_row = local_row_start + i;
+         bool is_schwarz_row = schwarz_dofs.count(global_row) > 0;
+
+         for (HYPRE_Int jj = offd_i[i]; jj < offd_i[i + 1]; ++jj)
+         {
+            HYPRE_Int j = offd_j[jj];
+            bool is_schwarz_col = offd_schwarz_cols.count(j) > 0;
+
+            if (is_schwarz_row)
+            {
+               // Contact row: zero all off-diagonal block entries
+               offd_data[jj] = 0.0;
+            }
+            else if (is_schwarz_col)
+            {
+               // Non-contact row but contact column: zero the entry
+               offd_data[jj] = 0.0;
+            }
+         }
+      }
+   }
+
+   /// Apply hybrid smoother: solve A*e = r for residual r = b - A*x, then update x += e
+   void ApplyHybridSmoother(const HypreParVector &b, HypreParVector &x) const
+   {
+      MFEM_VERIFY(A, "Operator must be set");
+      MFEM_VERIFY(gs_smoother, "GS smoother must be initialized");
+
+      hypre_ParCSRMatrix *parA = (hypre_ParCSRMatrix *)*A;
+      HYPRE_BigInt local_row_start = hypre_ParCSRMatrixFirstRowIndex(parA);
+      hypre_ParVector *par_x = (hypre_ParVector *)x;
+      hypre_Vector *local_x = hypre_ParVectorLocalVector(par_x);
+      HYPRE_Real *x_data = hypre_VectorData(local_x);
+      HYPRE_Int local_size = hypre_VectorSize(local_x);
+
+      // Compute residual: r = b - A*x
+      HypreParVector residual(b);
+      A->Mult(-1.0, x, 1.0, residual);  // residual = b - A*x
+
+      // Get local residual data
+      hypre_ParVector *par_r = (hypre_ParVector *)residual;
+      hypre_Vector *local_r = hypre_ParVectorLocalVector(par_r);
+      HYPRE_Real *r_data = hypre_VectorData(local_r);
+
+      // Prepare masked residual for GS smoother if zero_contact_dofs is true
+      HypreParVector gs_residual(residual);
+      HypreParVector gs_error(x);
+      gs_error = 0.0;
+
+      if (zero_contact_dofs)
+      {
+         // Zero out contact DoFs in residual for GS
+         hypre_ParVector *par_gs_r = (hypre_ParVector *)gs_residual;
+         hypre_Vector *local_gs_r = hypre_ParVectorLocalVector(par_gs_r);
+         HYPRE_Real *gs_r_data = hypre_VectorData(local_gs_r);
+
+         for (HYPRE_Int i = 0; i < local_size; ++i)
+         {
+            HYPRE_BigInt global_dof = local_row_start + i;
+            if (schwarz_dofs.count(global_dof) > 0)
+            {
+               gs_r_data[i] = 0.0;
+            }
+         }
+      }
+
+      // Step 1: Apply GS smoother to solve for error in non-contact DoFs
+      gs_smoother->Mult(gs_residual, gs_error);
+
+      // Update x with GS error
+      hypre_ParVector *par_gs_error = (hypre_ParVector *)gs_error;
+      hypre_Vector *local_gs_error = hypre_ParVectorLocalVector(par_gs_error);
+      HYPRE_Real *gs_error_data = hypre_VectorData(local_gs_error);
+
+      for (HYPRE_Int i = 0; i < local_size; ++i)
+      {
+         x_data[i] += gs_error_data[i];
+      }
+
+      // Step 2: Apply contact solver to compute and add contact correction
+      if (contact_solver)
+      {
+         if (use_direct_contact_solver)
+         {
+            MFEM_VERIFY(transfer_operator, "Transfer operator must be set for direct contact solver");
+
+            // For direct solver: extract subspace residual, solve, scatter correction back
+            HypreParVector residual_contact(*transfer_operator, 0);  // Domain of P = contact space
+            HypreParVector error_contact(*transfer_operator, 0);     // Domain of P = contact space
+            HypreParVector error_full(*transfer_operator, 1);        // Range of P = full space
+            residual_contact = 0.0;
+            error_contact = 0.0;
+            error_full = 0.0;
+
+            // Project residual to contact subspace: residual_contact = P^T * r
+            transfer_operator->MultTranspose(residual, residual_contact);
+
+            // Solve in contact subspace: error_contact = (P^T A P)^{-1} * residual_contact
+            contact_solver->Mult(residual_contact, error_contact);
+
+            // Scatter error back to full space: error_full = P * error_contact
+            transfer_operator->Mult(error_contact, error_full);
+
+            // Add contact correction to x (only affects contact DoFs)
+            hypre_ParVector *par_err = (hypre_ParVector *)error_full;
+            hypre_Vector *local_err = hypre_ParVectorLocalVector(par_err);
+            HYPRE_Real *err_data = hypre_VectorData(local_err);
+
+            for (HYPRE_Int i = 0; i < local_size; ++i)
+            {
+               HYPRE_BigInt global_dof = local_row_start + i;
+               if (schwarz_dofs.count(global_dof) > 0)
+               {
+                  x_data[i] += err_data[i];
+               }
+            }
+         }
+         else
+         {
+            // For Schwarz: operates on full space directly
+            HypreParVector contact_error(x);
+            contact_error = 0.0;
+            contact_solver->Mult(residual, contact_error);
+
+            // Add contact correction to x (only affects contact DoFs)
+            hypre_ParVector *par_err = (hypre_ParVector *)contact_error;
+            hypre_Vector *local_err = hypre_ParVectorLocalVector(par_err);
+            HYPRE_Real *err_data = hypre_VectorData(local_err);
+
+            for (HYPRE_Int i = 0; i < local_size; ++i)
+            {
+               HYPRE_BigInt global_dof = local_row_start + i;
+               if (schwarz_dofs.count(global_dof) > 0)
+               {
+                  x_data[i] += err_data[i];
+               }
+            }
+         }
+      }
+   }
+
+public:
+
+   using HypreSolver::Mult;
+
+   operator HYPRE_Solver() const override
+   {
+      return *amg;
+   }
+
+   HYPRE_PtrToParSolverFcn SetupFcn() const override
+   {
+      return amg->SetupFcn();
+   }
+
+   HYPRE_PtrToParSolverFcn SolveFcn() const override
+   {
+      return amg->SolveFcn();
+   }
+
+   ~HypreBoomerAMGWithSchwarzSmoother()
+   {
+      if (owns_amg && amg)
+      {
+         delete amg;
+      }
+      if (gs_smoother)
+      {
+         delete gs_smoother;
+      }
+      if (temp_residual)
+      {
+         delete temp_residual;
+         delete temp_correction;
+      }
+      if (masked_matrix)
+      {
+         delete masked_matrix;
+      }
+      // Don't delete transfer_operator or contact_solver - not owned by us
+   }
 };
 
 #endif // MFEM_SCHWARZ_SOLVER_HPP

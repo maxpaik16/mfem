@@ -26,14 +26,18 @@ MFEM_LIB_FILE = mfem_is_not_built
 
 
 ifeq ($(MFEM_USE_TRIBOL)$(MFEM_USE_MPI),YESYES)
-   MINIAPPS = test-contact
+   MINIAPPS = test-contact amg-benchmark amgf-spd-test
    TEST_CONTACT_SRC = elastoperator.cpp optcontactproblem.cpp ip.cpp solver_utils.cpp
 else
    MINIAPPS =
    TEST_CONTACT_SRC =
-   .PHONY: test-contact
+   .PHONY: test-contact amg-benchmark amgf-spd-test
    test-contact:
 	@echo "Rebuild MFEM with MFEM_USE_TRIBOL=YES and MFEM_USE_MPI=YES to build test-contact."
+   amg-benchmark:
+	@echo "Rebuild MFEM with MFEM_USE_MPI=YES to build amg-benchmark."
+   amgf-spd-test:
+	@echo "Rebuild MFEM with MFEM_USE_MPI=YES to build amgf-spd-test."
 endif
 
 TEST_CONTACT_OBJ = $(TEST_CONTACT_SRC:.cpp=.o)
@@ -48,6 +52,12 @@ TEST_CONTACT_OBJ = $(TEST_CONTACT_SRC:.cpp=.o)
 
 test-contact: $(SRC)test-contact.cpp $(MFEM_LIB_FILE) $(TEST_CONTACT_OBJ) $(CONFIG_MK)
 	$(MFEM_CXX) $(MFEM_FLAGS) $< -o $@ $(TEST_CONTACT_OBJ) $(MFEM_LIBS) -ltribol_shared -framework Accelerate
+
+amg-benchmark: $(SRC)amg-benchmark.cpp $(MFEM_LIB_FILE) solver_utils.o $(CONFIG_MK)
+	$(MFEM_CXX) $(MFEM_FLAGS) $< -o $@ solver_utils.o $(MFEM_LIBS) -framework Accelerate
+
+amgf-spd-test: $(SRC)amgf-spd-test.cpp $(MFEM_LIB_FILE) solver_utils.o $(CONFIG_MK)
+	$(MFEM_CXX) $(MFEM_FLAGS) $< -o $@ solver_utils.o $(MFEM_LIBS) -framework Accelerate
 
 %.o: $(SRC)%.cpp $(wildcard $(SRC)%.hpp) $(MFEM_LIB_FILE)\
  $(CONFIG_MK) | 
