@@ -54,7 +54,7 @@ mpl.rcParams['savefig.bbox'] = 'tight'
 mpl.rcParams['savefig.facecolor'] = 'white'
 
 # Professional color palette (colorblind-friendly)
-COLORS = ['#0173B2', '#DE8F05', '#029E73', '#CC78BC', '#CA9161', '#949494', '#ECE133', '#56B4E9']
+COLORS = ['#0173B2', '#DE8F05', '#029E73', '#CC78BC', '#D55E00', '#949494', '#ECE133', '#56B4E9']
 
 
 # =============================================================================
@@ -97,18 +97,21 @@ SWEEP_PARAMETERS = {
     #"amgf_reversed": [True, False],
     #"hybrid_amg": [True, False]
 
+    "schwarz_min_diag": [0, 1, 1e1, 1e2, 1e12]
+
     # Uncomment for other experiments:
     #"np": [1, 2, 4, 8],
-    "sr": [0, 1, 2],
+    #"sr": [0, 1, 2],
     # "pr": [0, 1],
     # "prob": [0, 1, 2],
 }
 
 # Which parameters define distinct curves in plots
 CURVE_KEYS = [
-    "amgf",
-    "schwarz",
+    #"amgf",
+    #"schwarz",
     #sr
+    "schwarz_min_diag"
 ]
 
 # Which parameter should be used for x-axis in summary plots.
@@ -267,7 +270,19 @@ def format_label_component(key, config):
     return f"{key}={value}"
 
 
-def config_to_label(config, keys):
+def format_dofs(dofs):
+    """Format degrees of freedom with K/M abbreviation."""
+    if dofs is None:
+        return None
+    if dofs >= 1_000_000:
+        return f"{dofs / 1_000_000:.1f}M"
+    elif dofs >= 1_000:
+        return f"{dofs / 1_000:.0f}K"
+    else:
+        return str(dofs)
+
+
+def config_to_label(config, keys, dofs=None):
     parts = []
 
     if any(k in keys for k in ("amgf", "schwarz", "amgf_fsolver", "schwarz_cg_iters")):
@@ -278,7 +293,15 @@ def config_to_label(config, keys):
         if component and component not in parts:
             parts.append(component)
 
-    return ", ".join(parts) if parts else format_solver_label(config)
+    label = ", ".join(parts) if parts else format_solver_label(config)
+
+    # Append dofs if provided
+    if dofs is not None:
+        dofs_str = format_dofs(dofs)
+        if dofs_str:
+            label += f" ({dofs_str} dofs)"
+
+    return label
 
 
 def config_to_command(config):
@@ -369,6 +392,16 @@ def parse_scalar_float(text, label):
     return float(match.group(1)) if match else None
 
 
+def parse_scalar_int_with_colon(text, label):
+    """Parse all occurrences of 'label: value' and return the average."""
+    pattern = rf"{re.escape(label)}\s*:\s*(\d+)"
+    matches = re.findall(pattern, text)
+    if matches:
+        values = [int(m) for m in matches]
+        return sum(values) / len(values)
+    return None
+
+
 def parse_amgf_setup_breakdown(text):
     pattern = re.compile(
         r"AMGF filtered setup time \[s\]: total=([0-9eE+.\-]+), "
@@ -422,6 +455,8 @@ def parse_run_output(output_text):
         "linear_solve_times": parse_float_list_line(output_text, "Linear solve times [s]"),
         "amgf_setup_breakdown": amgf_setup_breakdown,
         "amgf_solve_breakdown": amgf_solve_breakdown,
+        "global_dofs": parse_scalar_int(output_text, "Global number of dofs"),
+        "schwarz_subdomains_avg": parse_scalar_int_with_colon(output_text, "Total number of subdomains"),
     }
 
     data["num_linear_solves_from_iters"] = len(data["pcg_iterations"])
@@ -543,15 +578,28 @@ def save_run_artifacts(output_dir, run_id, config, result, parsed):
     save_json(run_dir / "run_metadata.json", metadata)
 
 
-def load_existing_runs(output_dir):
+def load_existing_runs(output_dir, base_config=None, sweep_parameters=None):
     runs_root = output_dir / "runs"
     records = []
 
     if not runs_root.exists():
         return records
 
+    # Generate expected run IDs based on current sweep parameters
+    expected_run_ids = None
+    if base_config is not None and sweep_parameters is not None:
+        configs = expand_sweep(base_config, sweep_parameters)
+        expected_run_ids = {
+            f"run_{i:03d}_{short_hash(config)}"
+            for i, config in enumerate(configs)
+        }
+
     for run_dir in sorted(runs_root.iterdir()):
         if not run_dir.is_dir():
+            continue
+
+        # If we have expected run IDs, only load those
+        if expected_run_ids is not None and run_dir.name not in expected_run_ids:
             continue
 
         config_file = run_dir / "config.json"
@@ -559,10 +607,24 @@ def load_existing_runs(output_dir):
         meta_file = run_dir / "run_metadata.json"
 
         if config_file.exists() and parsed_file.exists() and meta_file.exists():
+            parsed = load_json(parsed_file)
+
+            # If global_dofs or schwarz_subdomains_avg is missing or None, try to parse from stdout
+            if parsed.get("global_dofs") is None or parsed.get("schwarz_subdomains_avg") is None:
+                stdout_file = run_dir / "stdout.txt"
+                if stdout_file.exists():
+                    stdout_text = stdout_file.read_text()
+                    if parsed.get("global_dofs") is None:
+                        parsed["global_dofs"] = parse_scalar_int(stdout_text, "Global number of dofs")
+                        if parsed["global_dofs"] is not None:
+                            print(f"  Re-parsed global_dofs={parsed['global_dofs']} for {run_dir.name}")
+                    if parsed.get("schwarz_subdomains_avg") is None:
+                        parsed["schwarz_subdomains_avg"] = parse_scalar_int_with_colon(stdout_text, "Total number of subdomains")
+
             records.append({
                 "run_id": run_dir.name,
                 "config": load_json(config_file),
-                "parsed": load_json(parsed_file),
+                "parsed": parsed,
                 "metadata": load_json(meta_file),
             })
 
@@ -573,10 +635,11 @@ def load_existing_runs(output_dir):
 # PLOTTING
 # =============================================================================
 
-def group_records_by_curve(records, curve_keys):
+def group_records_by_curve(records, curve_keys, include_dofs=False):
     grouped = {}
     for record in records:
-        label = config_to_label(record["config"], curve_keys)
+        dofs = record["parsed"].get("global_dofs") if include_dofs else None
+        label = config_to_label(record["config"], curve_keys, dofs)
         grouped.setdefault(label, []).append(record)
     return grouped
 
@@ -584,6 +647,10 @@ def group_records_by_curve(records, curve_keys):
 def get_x_value(record, x_axis_mode, fallback_index):
     if x_axis_mode == "run_index":
         return fallback_index
+    # If x_axis_mode is "sr", use DOFs instead
+    if x_axis_mode == "sr":
+        dofs = record["parsed"].get("global_dofs")
+        return dofs if dofs is not None else fallback_index
     return record["config"].get(x_axis_mode, fallback_index)
 
 
@@ -605,7 +672,8 @@ def plot_per_solve_curves(records, output_dir):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
     for idx, rec in enumerate(valid):
-        label = config_to_label(rec["config"], CURVE_KEYS)
+        dofs = rec["parsed"].get("global_dofs")
+        label = config_to_label(rec["config"], CURVE_KEYS, dofs)
         color = COLORS[idx % len(COLORS)]
         pcg = rec["parsed"]["pcg_iterations"]
         times = rec["parsed"]["linear_solve_times"]
@@ -650,7 +718,9 @@ def plot_summary_curves(records, output_dir, x_axis_mode):
         print("No successful runs to summarize.")
         return
 
-    grouped = group_records_by_curve(valid, CURVE_KEYS)
+    # Don't include dofs in grouping/labels if x-axis is sr (which will be plotted as dofs)
+    include_dofs_in_label = (x_axis_mode != "sr")
+    grouped = group_records_by_curve(valid, CURVE_KEYS, include_dofs=include_dofs_in_label)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes = axes.flatten()
@@ -682,9 +752,15 @@ def plot_summary_curves(records, output_dir, x_axis_mode):
                        markeredgewidth=0.5, markeredgecolor='white')
 
         ax.set_title(metric_title, fontweight='bold', pad=12)
-        ax.set_xlabel(x_axis_mode.replace('_', ' ').title(), fontweight='semibold')
+        # If x_axis_mode is sr, label x-axis as DOFs and use log scale
+        x_label = "DOFs" if x_axis_mode == "sr" else x_axis_mode.replace('_', ' ').title()
+        ax.set_xlabel(x_label, fontweight='semibold')
         ax.set_ylabel(metric_title.split('(')[0].strip(), fontweight='semibold')
-        ax.grid(True, linestyle='--', linewidth=0.6)
+        if x_axis_mode == "sr":
+            ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, which='both', linestyle='--', linewidth=0.6)
+        ax.minorticks_on()
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.legend(frameon=True, fancybox=False, edgecolor='gray', framealpha=0.95)
@@ -704,7 +780,8 @@ def plot_scatter_time_vs_iterations(records, output_dir):
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    grouped = group_records_by_curve(valid, CURVE_KEYS)
+    # Don't include dofs in labels for scatter plot
+    grouped = group_records_by_curve(valid, CURVE_KEYS, include_dofs=False)
     for idx, (label, recs) in enumerate(grouped.items()):
         color = COLORS[idx % len(COLORS)]
         x = [r["parsed"]["pcg_total"] for r in recs]
@@ -801,17 +878,21 @@ def plot_timing_breakdown(records, output_dir, x_axis_mode):
 
 def print_summary_table(records):
     headers = [
-        "run_id", "returncode", "curve_label", "pcg_total", "pcg_mean",
+        "run_id", "returncode", "curve_label", "dofs", "avg_subdomains", "pcg_total", "pcg_mean",
         "time_total", "time_mean", "n_iters", "n_times"
     ]
     rows = []
 
     for rec in records:
         parsed = rec["parsed"]
+        dofs = parsed.get("global_dofs")
+        subdomains_avg = parsed.get("schwarz_subdomains_avg")
         rows.append([
             rec["run_id"],
             rec["metadata"]["returncode"],
             config_to_label(rec["config"], CURVE_KEYS),
+            format_dofs(dofs) if dofs else "N/A",
+            f"{subdomains_avg:.1f}" if subdomains_avg is not None else "N/A",
             parsed["pcg_total"],
             parsed["pcg_mean"],
             parsed["time_total"],
@@ -868,7 +949,8 @@ def main():
 
     if args.skip_run:
         print(f"Loading existing runs from {output_dir}")
-        records = load_existing_runs(output_dir)
+        records = load_existing_runs(output_dir, BASE_CONFIG, SWEEP_PARAMETERS)
+        print(f"Loaded {len(records)} runs matching SWEEP_PARAMETERS")
     else:
         if not Path(EXECUTABLE).exists():
             print(f"Error: executable not found: {EXECUTABLE}")
