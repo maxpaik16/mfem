@@ -1,0 +1,682 @@
+// Copyright (c) 2010-2024, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#ifndef MFEM_SCHWARZ_SOLVER_HPP
+#define MFEM_SCHWARZ_SOLVER_HPP
+
+#include "mfem.hpp"
+#include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
+
+using namespace mfem;
+
+// HYPRE and LAPACK declarations
+extern "C"
+{
+#include "HYPRE.h"
+#include "_hypre_parcsr_ls.h"
+#include "_hypre_utilities.h"
+
+void dpotrf_(const char *uplo, const int *n, double *a, const int *lda, int *info);
+void dgetrf_(const int *m, const int *n, double *a, const int *lda, int *ipiv, int *info);
+
+typedef struct
+{
+   HYPRE_Int      variant;
+   HYPRE_Int      domain_type;
+   HYPRE_Int      overlap;
+   HYPRE_Int      num_functions;
+   HYPRE_Int      use_nonsymm;
+   HYPRE_Real   relax_weight;
+
+   hypre_CSRMatrix *domain_structure;
+   hypre_CSRMatrix *A_boundary;
+   hypre_ParVector *Vtemp;
+   HYPRE_Real  *scale;
+   HYPRE_Int     *dof_func;
+   HYPRE_Int     *pivots;
+
+} hypre_SchwarzData;
+}
+
+// Dummy setup function for HYPRE Schwarz solver
+static HYPRE_Int DummyParSolverFcn(HYPRE_Solver solver,
+                                   HYPRE_ParCSRMatrix A,
+                                   HYPRE_ParVector b,
+                                   HYPRE_ParVector x)
+{
+   (void)solver;
+   (void)A;
+   (void)b;
+   (void)x;
+   return 0;
+}
+
+/// Schwarz domain decomposition solver wrapping HYPRE's Schwarz implementation
+class HypreSchwarz : public HypreSolver
+{
+public:
+   HYPRE_Solver schwarz_solver;
+
+   void SetOperator(const Operator &op) override
+   {
+      const HypreParMatrix *new_A = dynamic_cast<const HypreParMatrix *>(&op);
+      MFEM_VERIFY(new_A, "new Operator must be a HypreParMatrix!");
+
+      //HYPRE_SchwarzDestroy(schwarz_solver); TODO: fix leak :)
+      //HYPRE_SchwarzCreate(&schwarz_solver);
+
+      // update base classes: Operator, Solver, HypreSolver
+      height = new_A->Height();
+      width  = new_A->Width();
+      A = const_cast<HypreParMatrix *>(new_A);
+      setup_called = 0;
+      delete X;
+      delete B;
+      B = X = NULL;
+      auxB.Delete(); auxB.Reset();
+      auxX.Delete(); auxX.Reset();
+   }
+
+   HYPRE_CSRMatrix BuildDomainStructure(
+      const std::vector<std::vector<HYPRE_Int>>& subdomains)
+   {
+      const HYPRE_Int num_domains = static_cast<HYPRE_Int>(subdomains.size());
+
+      HYPRE_Int max_domain_size = 0;
+      HYPRE_Int total_memberships = 0;
+      HYPRE_Int total_dense_data = 0;
+
+      for (const auto& domain : subdomains)
+      {
+         const HYPRE_Int sz = static_cast<HYPRE_Int>(domain.size());
+         max_domain_size = std::max(max_domain_size, sz);
+         total_memberships += sz;
+         total_dense_data += sz * sz;
+      }
+
+      hypre_CSRMatrix* csr =
+         hypre_CSRMatrixCreate(num_domains, max_domain_size, total_memberships);
+
+      hypre_CSRMatrixInitialize(csr);
+
+      HYPRE_Int* I = hypre_CSRMatrixI(csr);
+      HYPRE_Int* J = hypre_CSRMatrixJ(csr);
+
+      HYPRE_Int nnz_counter = 0;
+      I[0] = 0;
+
+      for (HYPRE_Int i = 0; i < num_domains; i++)
+      {
+         const auto& domain = subdomains[i];
+         for (HYPRE_Int k = 0; k < static_cast<HYPRE_Int>(domain.size()); k++)
+         {
+            J[nnz_counter++] = domain[k];
+         }
+         I[i + 1] = nnz_counter;
+      }
+
+      HYPRE_Real* data =
+         hypre_CTAlloc(HYPRE_Real, total_dense_data, HYPRE_MEMORY_HOST);
+
+      for (HYPRE_Int i = 0; i < total_dense_data; i++)
+      {
+         data[i] = 0.0;
+      }
+
+      hypre_CSRMatrixData(csr) = data;
+
+      return (HYPRE_CSRMatrix) csr;
+   }
+
+   HYPRE_CSRMatrix domain_structure = nullptr;
+   HYPRE_Int *pivots = nullptr;
+   HYPRE_Real *scale = nullptr;
+
+   void SetCustomSubdomains(const std::vector<std::vector<HYPRE_BigInt>> &subdomains,
+                            HypreParMatrix &A,
+                            HYPRE_Real relax_weight = 1.0,
+                            HYPRE_Int use_nonsymm = 0,
+                            bool unweighted = false,
+                            HYPRE_Real uniform_weight = -1.0)
+   {
+      hypre_SchwarzData *sd = (hypre_SchwarzData *)schwarz_solver;
+      sd->relax_weight = relax_weight;
+      sd->use_nonsymm = use_nonsymm;
+      MFEM_VERIFY(sd != nullptr, "Invalid Schwarz solver.");
+
+      hypre_ParCSRMatrix *parA = (hypre_ParCSRMatrix *)A;
+      hypre_CSRMatrix *A_diag = hypre_ParCSRMatrixDiag(parA);
+      MFEM_VERIFY(A_diag != nullptr, "A_diag is null.");
+
+      HYPRE_Int num_dofs = hypre_CSRMatrixNumRows(A_diag);
+
+      // STEP 4a: Add MPI context and gather row partition
+      MPI_Comm comm = hypre_ParCSRMatrixComm(parA);
+      int myrank, nranks;
+      MPI_Comm_rank(comm, &myrank);
+      MPI_Comm_size(comm, &nranks);
+
+      // Get row partition for all ranks
+      // With assumed partition: row_starts is size 2 [local_start, local_end]
+      // Without: row_starts is size nranks+1 with all boundaries
+      const HYPRE_BigInt *row_starts = hypre_ParCSRMatrixRowStarts(parA);
+      const HYPRE_BigInt local_row_start = row_starts[0];
+      const HYPRE_BigInt local_row_end = row_starts[1];
+      const HYPRE_Int local_num_rows = local_row_end - local_row_start;
+
+      MFEM_VERIFY(num_dofs == local_num_rows,
+                  "A_diag size does not match local row count");
+
+      // Gather all row partitions
+      std::vector<HYPRE_BigInt> all_row_starts(nranks);
+      std::vector<HYPRE_BigInt> all_row_ends(nranks);
+      MPI_Allgather(&local_row_start, 1, HYPRE_MPI_BIG_INT,
+                    all_row_starts.data(), 1, HYPRE_MPI_BIG_INT, comm);
+      MPI_Allgather(&local_row_end, 1, HYPRE_MPI_BIG_INT,
+                    all_row_ends.data(), 1, HYPRE_MPI_BIG_INT, comm);
+
+      // Access diagonal and off-diagonal blocks
+      hypre_CSRMatrix *A_offd = hypre_ParCSRMatrixOffd(parA);
+      HYPRE_BigInt *col_map_offd = hypre_ParCSRMatrixColMapOffd(parA);
+      HYPRE_Int num_cols_offd = hypre_CSRMatrixNumCols(A_offd);
+
+      HYPRE_Int *Ai_offd = hypre_CSRMatrixI(A_offd);
+      HYPRE_Int *Aj_offd = hypre_CSRMatrixJ(A_offd);
+      HYPRE_Real *Aa_offd = hypre_CSRMatrixData(A_offd);
+
+      // Build mapping from global PTAP index to extended local index
+      // Extended indexing: [0, num_dofs) = local, [num_dofs, num_dofs+num_cols_offd) = ghost
+      std::map<HYPRE_BigInt, HYPRE_Int> global_to_extended_local;
+
+      // Map local DOFs
+      for (HYPRE_Int i = 0; i < num_dofs; ++i) {
+         global_to_extended_local[local_row_start + i] = i;
+      }
+
+      // Map ghost DOFs (from A_offd's column map)
+      for (HYPRE_Int j = 0; j < num_cols_offd; ++j) {
+         global_to_extended_local[col_map_offd[j]] = num_dofs + j;
+      }
+
+      // STEP 4a VERIFICATION
+      if (myrank == 0)
+      {
+         mfem::out << "SetCustomSubdomains: Processing " << subdomains.size()
+                   << " local subdomains, " << num_dofs << " local DOFs, "
+                   << num_cols_offd << " ghost DOFs" << std::endl;
+      }
+
+      if (domain_structure)
+      {
+         hypre_CSRMatrixDestroy((hypre_CSRMatrix *)domain_structure);
+         domain_structure = nullptr;
+      }
+      if (pivots)
+      {
+         hypre_TFree(pivots, HYPRE_MEMORY_HOST);
+         pivots = nullptr;
+      }
+      if (scale)
+      {
+         hypre_TFree(scale, HYPRE_MEMORY_HOST);
+         scale = nullptr;
+      }
+
+      if (sd->Vtemp)
+      {
+         hypre_ParVectorDestroy(sd->Vtemp);
+         sd->Vtemp = nullptr;
+      }
+
+      if (sd->A_boundary)
+      {
+         hypre_CSRMatrixDestroy(sd->A_boundary);
+         sd->A_boundary = nullptr;
+      }
+
+      {
+         hypre_ParVector *Vtemp =
+            hypre_ParVectorCreate(hypre_ParCSRMatrixComm(parA),
+                                  hypre_ParCSRMatrixGlobalNumRows(parA),
+                                  hypre_ParCSRMatrixRowStarts(parA));
+         hypre_ParVectorInitialize(Vtemp);
+         sd->Vtemp = Vtemp;
+      }
+
+      const HYPRE_Int num_domains = (HYPRE_Int)subdomains.size();
+      HYPRE_Int max_domain_size = 0;
+      HYPRE_Int total_memberships = 0;
+      size_t total_dense_data_sz = 0;
+      HYPRE_Int total_pivots = 0;
+
+      for (const auto &dom : subdomains)
+      {
+         HYPRE_Int sz = (HYPRE_Int)dom.size();
+         MFEM_VERIFY(sz >= 0, "Invalid subdomain size.");
+         max_domain_size = std::max(max_domain_size, sz);
+         total_memberships += sz;
+         total_pivots += sz;
+
+         size_t ssz = (size_t)sz;
+         total_dense_data_sz += ssz * ssz;
+      }
+
+      MFEM_VERIFY(total_dense_data_sz <= (size_t)std::numeric_limits<HYPRE_Int>::max(),
+                  "Dense subdomain storage exceeds HYPRE_Int capacity.");
+
+      HYPRE_Int total_dense_data = (HYPRE_Int)total_dense_data_sz;
+
+      // Domain structure uses extended indexing for variant 2
+      HYPRE_Int extended_size = num_dofs + num_cols_offd;
+
+      hypre_CSRMatrix *csr =
+         hypre_CSRMatrixCreate(num_domains, extended_size, total_memberships);
+      hypre_CSRMatrixInitialize(csr);
+
+      HYPRE_Int *I = hypre_CSRMatrixI(csr);
+      HYPRE_Int *J = hypre_CSRMatrixJ(csr);
+
+      I[0] = 0;
+      HYPRE_Int p = 0;
+
+      // STEP 4b: Convert global indices to extended local indices
+      int num_unmapped_dofs = 0;
+      for (HYPRE_Int d = 0; d < num_domains; d++)
+      {
+         const HYPRE_Int sz = (HYPRE_Int)subdomains[d].size();
+         for (HYPRE_Int k = 0; k < sz; k++)
+         {
+            HYPRE_BigInt gdof = subdomains[d][k];
+            // Map global to extended local index
+            auto it = global_to_extended_local.find(gdof);
+            if (it != global_to_extended_local.end())
+            {
+               J[p++] = it->second;
+            }
+            else
+            {
+               // This shouldn't happen if subdomains are properly constructed
+               num_unmapped_dofs++;
+            }
+         }
+         I[d + 1] = p;
+      }
+
+      if (num_unmapped_dofs > 0)
+      {
+         mfem::out << "WARNING: Rank " << myrank << " encountered " << num_unmapped_dofs
+                   << " unmapped DOFs (not in local or ghost set)" << std::endl;
+      }
+
+      HYPRE_Real *data = hypre_CTAlloc(HYPRE_Real, total_dense_data, HYPRE_MEMORY_HOST);
+      hypre_CSRMatrixData(csr) = data;
+
+      HYPRE_Int *Ai = hypre_CSRMatrixI(A_diag);
+      HYPRE_Int *Aj = hypre_CSRMatrixJ(A_diag);
+      HYPRE_Real *Aa = hypre_CSRMatrixData(A_diag);
+
+      // No need for MPI communication - HYPRE variant 2 handles ghost exchange
+      // Just extract dense subdomain blocks using global indices
+
+      if (use_nonsymm)
+      {
+         pivots = hypre_CTAlloc(HYPRE_Int, std::max<HYPRE_Int>(total_pivots, 1), HYPRE_MEMORY_HOST);
+      }
+
+      HYPRE_Int data_offset = 0;
+      HYPRE_Int piv_offset = 0;
+      char uplo = 'L';
+
+      // STEP 4: Extract dense subdomain blocks using global indices
+      // For local+ghost DOFs, extract from A_diag and A_offd
+      for (HYPRE_Int d = 0; d < num_domains; d++)
+      {
+         HYPRE_Int n = I[d + 1] - I[d];
+
+         for (HYPRE_Int i = 0; i < n; i++)
+         {
+            HYPRE_BigInt gi = J[I[d] + i];
+
+            // Skip if we own this row locally
+            if (gi >= local_row_start && gi < local_row_end) continue;
+
+            // Find which rank owns this row
+            int owner_rank = -1;
+            for (int r = 0; r < nranks; r++) {
+               if (gi >= all_row_starts[r] && gi < all_row_ends[r]) {
+                  owner_rank = r;
+                  break;
+               }
+            }
+
+            if (owner_rank < 0) continue;  // Skip invalid indices
+
+            // Request all entries A[gi, gj] where gj is in this subdomain
+            for (HYPRE_Int j = 0; j < n; j++)
+            {
+               HYPRE_BigInt gj = J[I[d] + j];
+               requests_to_send[owner_rank].push_back({gi, gj});
+            }
+         }
+      }
+
+      // STEP 4b VERIFICATION: Print statistics
+      int total_requests = 0;
+      for (int r = 0; r < nranks; r++) {
+         total_requests += requests_to_send[r].size();
+      }
+      if (total_requests > 0) {
+         mfem::out << "Rank " << myrank << " requesting " << total_requests
+                   << " remote matrix entries" << std::endl;
+      }
+
+      // STEP 4c: Exchange requests using MPI_Alltoallv
+      // Step 1: Exchange request counts
+      std::vector<int> send_counts(nranks), recv_counts(nranks);
+      for (int r = 0; r < nranks; r++) {
+         send_counts[r] = requests_to_send[r].size() * 2;  // 2 HYPRE_BigInt per request
+      }
+
+      MPI_Alltoall(send_counts.data(), 1, MPI_INT,
+                   recv_counts.data(), 1, MPI_INT, comm);
+
+      // Step 2: Compute displacements
+      std::vector<int> send_displs(nranks + 1, 0), recv_displs(nranks + 1, 0);
+      for (int r = 0; r < nranks; r++) {
+         send_displs[r + 1] = send_displs[r] + send_counts[r];
+         recv_displs[r + 1] = recv_displs[r] + recv_counts[r];
+      }
+
+      int total_send = send_displs[nranks];
+      int total_recv = recv_displs[nranks];
+
+      // Step 3: Pack send buffers
+      std::vector<HYPRE_BigInt> send_buffer(total_send);
+      int idx = 0;
+      for (int r = 0; r < nranks; r++) {
+         for (const auto &req : requests_to_send[r]) {
+            send_buffer[idx++] = req.row;
+            send_buffer[idx++] = req.col;
+         }
+      }
+
+      // Step 4: Exchange requests
+      std::vector<HYPRE_BigInt> recv_buffer(total_recv);
+      MPI_Alltoallv(send_buffer.data(), send_counts.data(), send_displs.data(),
+                    HYPRE_MPI_BIG_INT,
+                    recv_buffer.data(), recv_counts.data(), recv_displs.data(),
+                    HYPRE_MPI_BIG_INT, comm);
+
+      // STEP 4c VERIFICATION
+      mfem::out << "Rank " << myrank << " received " << (total_recv / 2)
+                << " matrix entry requests" << std::endl;
+
+      // STEP 4d: Process received requests and extract matrix entries
+      // Process requests: look up A[row, col] in local matrix
+      std::vector<HYPRE_Real> response_values(total_recv / 2, 0.0);
+
+      for (int i = 0; i < total_recv / 2; i++)
+      {
+         HYPRE_BigInt gi = recv_buffer[2 * i];
+         HYPRE_BigInt gj = recv_buffer[2 * i + 1];
+
+         // Convert global row to local
+         if (gi < local_row_start || gi >= local_row_end) continue;
+         HYPRE_Int local_i = gi - local_row_start;
+
+         // Search in A_diag
+         if (gj >= local_row_start && gj < local_row_end)
+         {
+            HYPRE_Int local_j = gj - local_row_start;
+            for (HYPRE_Int jj = Ai[local_i]; jj < Ai[local_i + 1]; jj++)
+            {
+               if (Aj[jj] == local_j) {
+                  response_values[i] = Aa[jj];
+                  break;
+               }
+            }
+         }
+         // Search in A_offd
+         else
+         {
+            for (HYPRE_Int jj = Ai_offd[local_i]; jj < Ai_offd[local_i + 1]; jj++)
+            {
+               if (col_map_offd[Aj_offd[jj]] == gj) {
+                  response_values[i] = Aa_offd[jj];
+                  break;
+               }
+            }
+         }
+      }
+
+      // STEP 4d VERIFICATION
+      mfem::out << "Rank " << myrank << " processed " << (total_recv / 2)
+                << " requests, sending responses" << std::endl;
+
+      // STEP 4e: Send responses back
+      // Send responses back (reverse of send/recv)
+      std::vector<HYPRE_Real> recv_values(total_send / 2);
+
+      // Convert counts/displs to value counts (half the size)
+      std::vector<int> send_value_counts(nranks), recv_value_counts(nranks);
+      std::vector<int> send_value_displs(nranks + 1), recv_value_displs(nranks + 1);
+
+      for (int r = 0; r < nranks; r++) {
+         send_value_counts[r] = recv_counts[r] / 2;
+         recv_value_counts[r] = send_counts[r] / 2;
+      }
+
+      send_value_displs[0] = recv_value_displs[0] = 0;
+      for (int r = 0; r < nranks; r++) {
+         send_value_displs[r + 1] = send_value_displs[r] + send_value_counts[r];
+         recv_value_displs[r + 1] = recv_value_displs[r] + recv_value_counts[r];
+      }
+
+      MPI_Alltoallv(response_values.data(), send_value_counts.data(),
+                    send_value_displs.data(), MPI_DOUBLE,
+                    recv_values.data(), recv_value_counts.data(),
+                    recv_value_displs.data(), MPI_DOUBLE, comm);
+
+      // STEP 4e VERIFICATION
+      mfem::out << "Rank " << myrank << " received " << recv_values.size()
+                << " matrix entry responses" << std::endl;
+
+      // STEP 4f: Build cache of received remote entries
+      // Build map of (row, col) -> value for remote entries
+      std::map<std::pair<HYPRE_BigInt, HYPRE_BigInt>, HYPRE_Real> remote_entries;
+
+      idx = 0;
+      for (int r = 0; r < nranks; r++) {
+         for (size_t k = 0; k < requests_to_send[r].size(); k++) {
+            HYPRE_BigInt row = requests_to_send[r][k].row;
+            HYPRE_BigInt col = requests_to_send[r][k].col;
+            remote_entries[{row, col}] = recv_values[idx++];
+         }
+      }
+
+      // STEP 4f VERIFICATION
+      mfem::out << "Rank " << myrank << " cached " << remote_entries.size()
+                << " remote entries" << std::endl;
+
+      if (use_nonsymm)
+      {
+         pivots = hypre_CTAlloc(HYPRE_Int, std::max<HYPRE_Int>(total_pivots, 1), HYPRE_MEMORY_HOST);
+      }
+
+      HYPRE_Int data_offset = 0;
+      HYPRE_Int piv_offset = 0;
+      char uplo = 'L';
+
+      // STEP 4g: Extract dense subdomain blocks using local + remote entries
+      for (HYPRE_Int d = 0; d < num_domains; d++)
+      {
+         HYPRE_Int n = I[d + 1] - I[d];
+         MFEM_VERIFY(n >= 0, "Negative subdomain size.");
+
+         HYPRE_Real *AE = &data[data_offset];
+         std::fill(AE, AE + (size_t)n * (size_t)n, 0.0);
+
+         // Extract all entries A[gi, gj] for subdomain
+         for (HYPRE_Int i = 0; i < n; i++)
+         {
+            HYPRE_BigInt gi = J[I[d] + i];
+
+            for (HYPRE_Int j = 0; j < n; j++)
+            {
+               HYPRE_BigInt gj = J[I[d] + j];
+
+               // Check if locally owned row
+               if (gi >= local_row_start && gi < local_row_end)
+               {
+                  HYPRE_Int local_i = gi - local_row_start;
+
+                  // Search A_diag
+                  if (gj >= local_row_start && gj < local_row_end)
+                  {
+                     HYPRE_Int local_j = gj - local_row_start;
+                     for (HYPRE_Int jj = Ai[local_i]; jj < Ai[local_i + 1]; jj++)
+                     {
+                        if (Aj[jj] == local_j) {
+                           AE[i + j * n] = Aa[jj];
+                           break;
+                        }
+                     }
+                  }
+                  // Search A_offd
+                  else
+                  {
+                     for (HYPRE_Int jj = Ai_offd[local_i]; jj < Ai_offd[local_i + 1]; jj++)
+                     {
+                        if (col_map_offd[Aj_offd[jj]] == gj) {
+                           AE[i + j * n] = Aa_offd[jj];
+                           break;
+                        }
+                     }
+                  }
+               }
+               // Remote row - use cached value
+               else
+               {
+                  auto it = remote_entries.find({gi, gj});
+                  if (it != remote_entries.end()) {
+                     AE[i + j * n] = it->second;
+                  }
+               }
+            }
+         }
+
+         // STEP 4g VERIFICATION: check for zero diagonal
+         if (n > 0) {
+            int zero_diag = 0;
+            for (HYPRE_Int i = 0; i < n; i++) {
+               if (std::abs(AE[i + i * n]) < 1.e-14) {
+                  zero_diag++;
+               }
+            }
+            if (zero_diag > 0) {
+               mfem::out << "WARNING: Rank " << myrank << " subdomain " << d
+                         << " has " << zero_diag << " zero diagonal entries" << std::endl;
+            }
+         }
+
+         // Factorize subdomain
+         if (n > 0)
+         {
+            if (use_nonsymm)
+            {
+               int nn = (int)n;
+               int info = 0;
+               dgetrf_(&nn, &nn, AE, &nn,
+                       reinterpret_cast<int *>(&pivots[piv_offset]), &info);
+               MFEM_VERIFY(info == 0, "LU factorization failed for Schwarz subdomain.");
+               piv_offset += n;
+            }
+            else
+            {
+               int nn = (int)n;
+               int info = 0;
+               dpotrf_(&uplo, &nn, AE, &nn, &info);
+               MFEM_VERIFY(info == 0, "Cholesky factorization failed for Schwarz subdomain.");
+            }
+         }
+
+         data_offset += n * n;
+      }
+
+      domain_structure = (HYPRE_CSRMatrix)csr;
+
+      hypre_GenerateScale(csr, num_dofs, relax_weight, &scale);
+
+      // If uniform_weight is specified (>= 0), override per-DOF scaling with the specified value
+      if (uniform_weight >= 0.0)
+      {
+         for (int i = 0; i < num_dofs; ++i)
+         {
+            scale[i] = uniform_weight;
+         }
+      }
+      // Otherwise, if unweighted flag is set, override per-DOF scaling with uniform scaling of 1.0
+      else if (unweighted)
+      {
+         for (int i = 0; i < num_dofs; ++i)
+         {
+            scale[i] = 1.0;
+         }
+      }
+
+      sd->domain_structure = csr;
+      sd->pivots = pivots;
+      sd->scale = scale;
+      sd->A_boundary = nullptr;
+
+      HYPRE_SchwarzSetDomainStructure(schwarz_solver, domain_structure);
+   }
+
+   operator HYPRE_Solver() const override { return schwarz_solver; }
+   HYPRE_PtrToParSolverFcn SetupFcn() const override
+   { return (HYPRE_PtrToParSolverFcn) DummyParSolverFcn; }
+   HYPRE_PtrToParSolverFcn SolveFcn() const override
+   {
+      static auto wrapped_solve = [](HYPRE_Solver solver, HYPRE_ParCSRMatrix A,
+                                      HYPRE_ParVector b, HYPRE_ParVector x) -> HYPRE_Int
+      {
+         HYPRE_Int result = HYPRE_SchwarzSolve(solver, A, b, x);
+
+         // Compute residual: r = b - A*x
+         hypre_ParVector *residual = hypre_ParVectorCreate(
+            hypre_ParCSRMatrixComm((hypre_ParCSRMatrix*)A),
+            hypre_ParCSRMatrixGlobalNumRows((hypre_ParCSRMatrix*)A),
+            hypre_ParCSRMatrixRowStarts((hypre_ParCSRMatrix*)A));
+         hypre_ParVectorInitialize(residual);
+         hypre_ParVectorCopy((hypre_ParVector*)b, residual);
+         hypre_ParCSRMatrixMatvec(-1.0, (hypre_ParCSRMatrix*)A,
+                                  (hypre_ParVector*)x, 1.0, residual);
+
+         HYPRE_Real residual_norm = hypre_ParVectorInnerProd(residual, residual);
+         residual_norm = std::sqrt(residual_norm);
+
+         HYPRE_Real b_norm = hypre_ParVectorInnerProd((hypre_ParVector*)b, (hypre_ParVector*)b);
+         b_norm = std::sqrt(b_norm);
+
+         std::cout << "Schwarz solve residual norm: " << residual_norm << ", RHS norm: " << b_norm << std::endl;
+
+         hypre_ParVectorDestroy(residual);
+         return result;
+      };
+      return (HYPRE_PtrToParSolverFcn) +wrapped_solve;
+   }
+   using HypreSolver::Mult;
+};
+
+#endif // MFEM_SCHWARZ_SOLVER_HPP
