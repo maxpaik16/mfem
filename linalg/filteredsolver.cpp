@@ -250,7 +250,9 @@ void AMGFSolver::EnableAutoFilteredSubspace(
                "required when enable is true.");
    auto_subspace = enable;
    auto_subspace_solver_factory = std::move(solver_factory);
-   auto_subspace_solver.reset();
+   // Keep the current auto_subspace_solver, since the base class may still be
+   // using it. Resetting the width makes the next generated subspace replace
+   // it with a solver built by the new factory.
    auto_subspace_width = -1;
    auto_max_iter = max_iter;
    auto_tol = tol;
@@ -291,11 +293,27 @@ bool AMGFSolver::GenerateFilteredSubspaceTransferOperator(int max_iter,
    // share entries in a given row.
    real_t *l1_norms_raw = nullptr;
    hypre_ParCSRComputeL1Norms(*Ah, 1, NULL, &l1_norms_raw);
-   MFEM_VERIFY(l1_norms_raw,
+   // hypre returns a null array on a rank that owns no rows.
+   MFEM_VERIFY(l1_norms_raw || nrows_local == 0,
                "AMGFSolver::GenerateFilteredSubspaceTransferOperator: "
-               "failed to compute L1 row norms (zero row in operator?).");
+               "failed to compute L1 row norms.");
    HypreArrayGuard l1_guard{l1_norms_raw};
-   const Vector x(l1_norms_raw, nrows_local);
+
+   // Copy the norms to a host vector, since hypre allocates them in its own
+   // memory space, which can be device memory. hypre also negates the norm
+   // of every row with a negative diagonal entry, so take the absolute value.
+   Vector x(nrows_local);
+   if (nrows_local > 0)
+   {
+      Memory<real_t> l1_norms(l1_norms_raw, nrows_local, GetHypreMemoryType(),
+                              false);
+      const real_t *h_l1_norms = l1_norms.Read(MemoryClass::HOST, nrows_local);
+      for (int i = 0; i < nrows_local; i++)
+      {
+         x(i) = std::abs(h_l1_norms[i]);
+      }
+      l1_norms.Delete();
+   }
 
    // Global number of rows, across all ranks.
    HYPRE_BigInt n_local = nrows_local, n_global;
@@ -414,14 +432,20 @@ bool AMGFSolver::GenerateFilteredSubspaceTransferOperator(int max_iter,
       if (log_p_large > log_p_small) { selected_rows.Append(i); }
    }
 
+   // The selection matrix has a single unit entry per row, so its CSR arrays
+   // are built directly, with the global column indices kept as HYPRE_BigInt.
    const int nrows_f = selected_rows.Size();
-   SparseMatrix Pft(nrows_f, Ah->GetGlobalNumCols());
+   const HYPRE_BigInt col_offset = Ah->ColPart()[0];
+   Array<int> I(nrows_f+1);
+   Array<HYPRE_BigInt> J(nrows_f);
+   Vector data(nrows_f);
    for (int i = 0; i < nrows_f; i++)
    {
-      int col = Ah->ColPart()[0] + selected_rows[i];
-      Pft.Set(i, col, 1.0);
+      I[i] = i;
+      J[i] = col_offset + selected_rows[i];
    }
-   Pft.Finalize();
+   I[nrows_f] = nrows_f;
+   data = 1.0;
 
    HYPRE_BigInt nrows_f_bigint = nrows_f;
    HYPRE_BigInt row_offset_f;
@@ -434,23 +458,10 @@ bool AMGFSolver::GenerateFilteredSubspaceTransferOperator(int max_iter,
    MPI_Allreduce(&nrows_f_bigint, &glob_nrows_f, 1,
                  MPITypeMap<HYPRE_BigInt>::mpi_type, MPI_SUM, comm);
 
-   HYPRE_BigInt *J;
-#ifndef HYPRE_BIGINT
-   J = Pft.GetJ();
-#else
-   J = new HYPRE_BigInt[Pft.NumNonZeroElems()];
-   for (int i = 0; i < Pft.NumNonZeroElems(); i++)
-   {
-      J[i] = Pft.GetJ()[i];
-   }
-#endif
-
    std::unique_ptr<HypreParMatrix> P_ft(
       new HypreParMatrix(comm, nrows_f, glob_nrows_f, Ah->GetGlobalNumCols(),
-                         Pft.GetI(), J, Pft.GetData(), rows_f, Ah->ColPart()));
-#ifdef HYPRE_BIGINT
-   delete [] J;
-#endif
+                         I.GetData(), J.GetData(), data.GetData(), rows_f,
+                         Ah->ColPart()));
 
    generated_transfer.reset(P_ft->Transpose());
    SetFilteredSubspaceTransferOperator(*generated_transfer);

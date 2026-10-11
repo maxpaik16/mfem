@@ -295,6 +295,9 @@ public:
    * Instead, @a solver_factory is called to build a fresh subspace solver
    * whenever the subspace width changes; AMGFSolver owns the resulting
    * solver and destroys it when it is replaced or when *this is destroyed.
+   * Calling this function does not discard the transfer operator and subspace
+   * solver generated so far, even when @a enable is false: they stay in use
+   * until a later generation or one of the setters replaces them.
    *
    * While automatic generation is enabled, every SetOperator() call replaces
    * the transfer operator and, when the subspace size changes, the subspace
